@@ -81,6 +81,103 @@ async function lookup(env, prefix, query) {
   return hit ? env.TOILET_KV.get(hit.name, 'json') : null;
 }
 
+// ---- i18n: normalize raw JP values to an English-first schema (response layer only;
+//      raw KV data is never mutated, so re-imports stay safe) --------------------------
+const GENDER_EN = { '共用': 'all', '男性用': 'male', '女性用': 'female' };
+const LINE_EN = {
+  '山手線': 'Yamanote Line', '中央線': 'Chuo Line', '中央本線': 'Chuo Line', '中央・総武線': 'Chuo-Sobu Line',
+  '総武線': 'Sobu Line', '京浜東北線': 'Keihin-Tohoku Line', '埼京線': 'Saikyo Line',
+  '湘南新宿ライン': 'Shonan-Shinjuku Line', '横須賀線': 'Yokosuka Line', '京葉線': 'Keiyo Line',
+  '小田原線': 'Odakyu Odawara Line', '多摩線': 'Odakyu Tama Line', '江ノ島線': 'Odakyu Enoshima Line',
+  '井の頭線': 'Keio Inokashira Line', '京王線': 'Keio Line', '相模原線': 'Keio Sagamihara Line',
+  '東横線': 'Tokyu Toyoko Line', '田園都市線': 'Tokyu Den-en-toshi Line', '目黒線': 'Tokyu Meguro Line',
+  '大井町線': 'Tokyu Oimachi Line', '池上線': 'Tokyu Ikegami Line',
+  '銀座線': 'Ginza Line', '丸ノ内線': 'Marunouchi Line', '日比谷線': 'Hibiya Line', '東西線': 'Tozai Line',
+  '千代田線': 'Chiyoda Line', '有楽町線': 'Yurakucho Line', '半蔵門線': 'Hanzomon Line', '南北線': 'Namboku Line',
+  '副都心線': 'Fukutoshin Line',
+  '浅草線': 'Asakusa Line', '三田線': 'Mita Line', '新宿線': 'Shinjuku Line', '大江戸線': 'Oedo Line',
+  '京成本線': 'Keisei Main Line', '押上線': 'Keisei Oshiage Line',
+  '東武スカイツリーライン': 'Tobu Skytree Line', '伊勢崎線': 'Tobu Isesaki Line', '東上線': 'Tobu Tojo Line',
+  '西武池袋線': 'Seibu Ikebukuro Line', '池袋線': 'Seibu Ikebukuro Line', '西武新宿線': 'Seibu Shinjuku Line',
+  '京急本線': 'Keikyu Main Line', '空港線': 'Keikyu Airport Line',
+};
+const GATE_DIR_EN = {
+  '東改札': 'East Gate', '西改札': 'West Gate', '南改札': 'South Gate', '北改札': 'North Gate',
+  '中央改札': 'Central Gate', '新南改札': 'New South Gate', '中央東改札': 'Central East Gate', '中央西改札': 'Central West Gate',
+  '東口': 'East Exit', '西口': 'West Exit', '南口': 'South Exit', '北口': 'North Exit',
+  '中央口': 'Central Exit', '中央東口': 'Central East Exit', '中央西口': 'Central West Exit',
+};
+
+function normHours(raw) {
+  if (!raw) return null;
+  if (raw === '始発〜終車') return 'first_train_to_last_train';
+  if (/^\d/.test(raw)) return raw.replace('〜', '-'); // numeric time range → strip JP punctuation
+  return null;
+}
+function cleanLine(line) { return (line || '').replace(/^\d+号線/, ''); }
+function lineEn(line) {
+  const c = cleanLine(line);
+  if (!c) return null;
+  if (c.includes('/')) {
+    const parts = c.split('/').map((p) => LINE_EN[p.trim()]).filter(Boolean);
+    return parts.length ? parts.join(' / ') : null;
+  }
+  return LINE_EN[c] || null;
+}
+function exitEn(raw) {
+  const t = (raw || '').trim();
+  const m = t.match(/^([A-Za-z]?\d+[A-Za-z]?)番?出口$/);
+  if (m) return `Exit ${m[1]}`;
+  if (/^[A-Za-z]\d+$/.test(t)) return `Exit ${t}`;
+  if (t.startsWith('JR') && GATE_DIR_EN[t.slice(2)]) return 'JR ' + GATE_DIR_EN[t.slice(2)];
+  return GATE_DIR_EN[t] || null;
+}
+function structExit(rawName, m) {
+  const distance_m = (typeof m === 'number') ? m : null;
+  if (!rawName || rawName === '出口' || rawName === '改札') {
+    return { name: null, name_ja: null, distance_m, named: false };
+  }
+  return { name: exitEn(rawName), name_ja: rawName, distance_m, named: true };
+}
+function toEnglishToilet(r) {
+  return {
+    name: 'Accessible Toilet',
+    name_ja: r.name || null,
+    type: 'accessible',
+    line: lineEn(r.line),
+    line_ja: cleanLine(r.line) || null,
+    floor: r.floor || null,
+    gender: GENDER_EN[r.gender] ?? null,
+    wheelchair: !!r.wheelchair,
+    ostomate: !!r.ostomate,
+    diaper: !!r.diaper,
+    hours: normHours(r.hours),
+    nearest_exit: structExit(r.nearest_exit, r.nearest_exit_m),
+  };
+}
+async function toEnglishStation(env, found) {
+  const en = await env.TOILET_KV.get(`en:${found.station}`);
+  return {
+    station: en || found.station,
+    station_ja: found.station,
+    station_name_source: en ? 'odpt' : 'japanese_fallback',
+    count: found.count,
+    toilets: (found.toilets || []).map(toEnglishToilet),
+  };
+}
+function toEnglishCity(found) {
+  return {
+    city: found.city,
+    count: found.count,
+    returned: found.returned,
+    toilets: (found.toilets || []).map((t) => ({
+      name: t.name, addr: t.addr, lat: t.lat, lon: t.lon,
+      wheelchair: !!t.wheelchair, baby: !!t.baby, ostomate: !!t.ostomate,
+      hours: normHours(t.hours),
+    })),
+  };
+}
+
 function rpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -170,9 +267,14 @@ async function handleRpc(body, env) {
     if (!tool) return rpcError(id, -32602, `unknown tool: ${params?.name}`);
     const query = params?.arguments?.[tool.argName];
     const found = query ? await lookup(env, tool.prefix, query) : null;
-    const payload = found
-      ? { ...found, attribution: tool.attribution }
-      : { error: `No data found for "${query}".`, attribution: tool.attribution };
+    let payload;
+    if (!found) {
+      payload = { error: `No data found for "${query}".`, attribution: tool.attribution };
+    } else if (tool.name === 'get_toilet_by_station') {
+      payload = { ...(await toEnglishStation(env, found)), attribution: tool.attribution };
+    } else {
+      payload = { ...toEnglishCity(found), attribution: tool.attribution };
+    }
     return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
   }
   return rpcError(id, -32601, `method not found: ${method}`);
@@ -193,9 +295,17 @@ export default {
     if (request.method === 'GET' && url.pathname === '/example') {
       const tool = TOOLS.find((t) => t.name === 'get_toilet_by_station');
       const found = await lookup(env, tool.prefix, '新宿');
+      const en = found ? await toEnglishStation(env, found) : null;
+      if (en) {
+        // showcase only cleanly-named exits, closest first
+        const nice = en.toilets
+          .filter((t) => t.nearest_exit.named && t.nearest_exit.name)
+          .sort((a, b) => (a.nearest_exit.distance_m ?? 1e9) - (b.nearest_exit.distance_m ?? 1e9));
+        if (nice.length) { en.toilets = nice; en.count = nice.length; }
+      }
       const payload = {
-        note: 'Live sample of get_toilet_by_station("新宿"). Get a free key at https://api.gachi-tokusuru.com to query any station via MCP.',
-        ...found,
+        note: 'Live sample of get_toilet_by_station("Shinjuku"). Get a free key at https://api.gachi-tokusuru.com to query any station via MCP.',
+        ...(en || { error: 'sample unavailable' }),
         attribution: tool.attribution,
       };
       return Response.json(payload, { headers: { 'access-control-allow-origin': '*' } });
@@ -311,7 +421,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>MCP access — production use in your agent/app</td></tr>
 <tr><td class="price">Business</td><td>Contact</td><td>—</td><td>Station master (cross-operator), ridership trends &amp; bulk datasets — <i>in development</i></td></tr>
 </table>
-<p><a href="#bizform">Upgrade to Pro — $19/mo →</a> <span class="mut">(early access: contact us below and we'll set you up)</span></p>
+<p><a href="https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00" target="_blank" rel="noopener"><b>Subscribe to Pro — $19/mo →</b></a> <span class="mut">(after checkout we email your Pro key, 100K req/mo, to your Stripe email within 24h)</span></p>
 
 <h2>Get a free API key</h2>
 <p class="mut">Enter your email — your key is issued instantly on this page (1,000 req/mo, no card required).</p>
@@ -337,8 +447,8 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
        "params":{"name":"get_toilet_by_station","arguments":{"station":"Shinjuku"}}}'</pre>
 
-<h2>Start Pro, or ask about Business / bulk data</h2>
-<p class="mut">Want Pro ($19/mo) or the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
+<h2>Business / bulk data</h2>
+<p class="mut">Interested in the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
 <form id="bizform">
 <input type="email" id="bemail" placeholder="you@example.com" required>
 <textarea id="buse" rows="2" placeholder="What would you use it for? (1 line)" required></textarea>
