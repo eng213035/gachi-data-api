@@ -527,7 +527,8 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </form>
 
 <footer>
-Data: Tokyo Metropolitan Government &amp; BODIK municipal open data (CC BY 4.0). <code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.
+<p><b><a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription →</a></b> (Pro subscribers) &nbsp;·&nbsp; contact@piachan.com</p>
+<p>Data: Tokyo Metropolitan Government &amp; BODIK municipal open data (CC BY 4.0). <code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.</p>
 </footer>
 
 <script>
