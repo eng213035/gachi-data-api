@@ -463,7 +463,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </style></head><body><div class="wrap">
 
 <h1>Japan Toilet &amp; Accessibility API <span class="tag">Early access</span></h1>
-<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as REST and <b>MCP</b>.</p>
+<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as an <b>MCP</b> server (REST coming soon).</p>
 
 <div class="demo">
 <b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
