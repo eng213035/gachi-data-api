@@ -239,6 +239,44 @@ async function issueFreeKey(env, email) {
   return token;
 }
 
+async function issueProKey(env, email) {
+  const token = randToken('gk_pro_');
+  const record = { plan: 'pro', email, status: 'active', created: new Date().toISOString() };
+  await env.TOILET_KV.put(`key:${token}`, JSON.stringify(record));
+  const c = parseInt((await env.TOILET_KV.get('stat:pro_keys_issued')) || '0', 10);
+  await env.TOILET_KV.put('stat:pro_keys_issued', String(c + 1));
+  return token;
+}
+
+// Verify a paid Stripe Checkout Session and hand back a Pro key (idempotent per session).
+async function activatePro(env, sessionId) {
+  const cached = await env.TOILET_KV.get(`session:${sessionId}`, 'json');
+  if (cached) return { ok: true, ...cached }; // already activated → same key
+
+  const resp = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
+    headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
+  });
+  if (!resp.ok) return { ok: false, reason: 'verify_failed' };
+  const s = await resp.json();
+  const paid = s.payment_status === 'paid' || s.status === 'complete';
+  if (!paid) return { ok: false, reason: 'not_paid' };
+
+  const email = s.customer_details?.email || s.customer_email || '';
+  const key = await issueProKey(env, email);
+  const rec = { key, email };
+  await env.TOILET_KV.put(`session:${sessionId}`, JSON.stringify(rec));
+  return { ok: true, ...rec };
+}
+
+function activatePage(body) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Pro activation</title>
+<style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1a1a1a}
+code{background:#f6f8f7;border:1px solid #e3e8e6;border-radius:6px;padding:2px 6px;word-break:break-all}
+.key{display:block;background:#eef6f2;border:1px solid #bfe6d5;border-radius:8px;padding:14px;font-family:ui-monospace,Menlo,monospace;margin:12px 0;word-break:break-all}
+.mut{color:#666;font-size:14px}a{color:#0b6}</style></head><body>${body}</body></html>`;
+}
+
 async function saveInterest(env, email, useCase) {
   const id = randToken('int_');
   await env.TOILET_KV.put(
@@ -309,6 +347,33 @@ export default {
         attribution: tool.attribution,
       };
       return Response.json(payload, { headers: { 'access-control-allow-origin': '*' } });
+    }
+
+    // Pro activation — Stripe redirects here after a successful subscription checkout.
+    if (request.method === 'GET' && url.pathname === '/pro-activate') {
+      const sid = url.searchParams.get('session_id') || '';
+      const htmlHeaders = { 'content-type': 'text/html; charset=utf-8' };
+      if (!/^cs_[A-Za-z0-9_]+$/.test(sid)) {
+        return new Response(activatePage(
+          '<h1>Pro activation</h1><p>Missing or invalid session. If you just paid and see this, contact support with your payment email.</p>'
+          + '<p class="mut">contact@piachan.com</p>'), { headers: htmlHeaders, status: 400 });
+      }
+      const r = await activatePro(env, sid);
+      if (!r.ok) {
+        const msg = r.reason === 'not_paid'
+          ? 'Payment is not completed yet. If you just paid, refresh this page in a few seconds.'
+          : 'We could not verify your payment automatically. Please contact support with your payment email — we\'ll send your key.';
+        return new Response(activatePage(`<h1>Pro activation</h1><p>${msg}</p><p class="mut">contact@piachan.com</p>`),
+          { headers: htmlHeaders });
+      }
+      return new Response(activatePage(
+        '<h1>✅ You\'re on Pro</h1>'
+        + '<p>Thanks for subscribing. Here is your Pro API key (100,000 requests/month):</p>'
+        + `<code class="key">${r.key}</code>`
+        + '<p><b>Save it now</b> — treat it like a password. Use it as <code>Authorization: Bearer &lt;key&gt;</code> at '
+        + '<code>https://api.gachi-tokusuru.com/mcp</code>.</p>'
+        + '<p class="mut">A copy is tied to your subscription; reopening this page shows the same key. '
+        + 'Questions? contact@piachan.com</p>'), { headers: htmlHeaders });
     }
 
     // Self-serve free key
@@ -421,7 +486,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>Production volume — same full MCP access</td></tr>
 <tr><td class="price">Business</td><td>Contact</td><td>—</td><td>Station master (cross-operator), ridership trends &amp; bulk datasets — <i>in development</i></td></tr>
 </table>
-<p><a href="https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00" target="_blank" rel="noopener"><b>Subscribe to Pro — $19/mo →</b></a> <span class="mut">(after checkout we email your Pro key, 100K req/mo, to your Stripe email within 24h)</span></p>
+<p><a href="https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00" target="_blank" rel="noopener"><b>Subscribe to Pro — $19/mo →</b></a> <span class="mut">(your Pro key, 100K req/mo, is shown instantly after checkout)</span></p>
 
 <h2>Get a free API key</h2>
 <p class="mut">Enter your email — your key is issued instantly on this page (1,000 req/mo, no card required).</p>
