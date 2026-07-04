@@ -447,6 +447,8 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
        "params":{"name":"get_toilet_by_station","arguments":{"station":"Shinjuku"}}}'</pre>
 
+<p class="mut">Prefer a plain REST endpoint over MCP? It's on the roadmap — <a href="#bizform">tell us your use case</a> and we'll prioritize it.</p>
+
 <h2>Business / bulk data</h2>
 <p class="mut">Interested in the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
 <form id="bizform">
