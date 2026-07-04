@@ -2,7 +2,7 @@
 // - Multi-key auth (self-serve free keys stored in KV)
 // - Per-plan monthly rate limiting (KV counter; eventually consistent = approximate, fine for MVP)
 // - English landing page + free-key form + Business interest form
-// Data served straight from Cloudflare KV. Hosted service — see README.
+// Data served straight from KV (see build_kv_seed*.py). No D1/Stripe-webhook in this lean build.
 
 const PLAN_LIMITS = { free: 1000, pro: 100000, admin: Infinity };
 
@@ -178,7 +178,7 @@ async function handleRpc(body, env) {
   return rpcError(id, -32601, `method not found: ${method}`);
 }
 
-const UPGRADE_URL = 'https://api.gachi-tokusuru.com'; // landing page with pricing + Pro contact
+const UPGRADE_URL = 'https://api.gachi-tokusuru.com'; // landing page with pricing + PayPal Pro link
 
 export default {
   async fetch(request, env) {
@@ -187,6 +187,18 @@ export default {
     // Landing page
     if (request.method === 'GET' && url.pathname === '/') {
       return new Response(LANDING_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+
+    // No-auth sample response (click-to-try; fixed to Shinjuku so it isn't a free unlimited API)
+    if (request.method === 'GET' && url.pathname === '/example') {
+      const tool = TOOLS.find((t) => t.name === 'get_toilet_by_station');
+      const found = await lookup(env, tool.prefix, '新宿');
+      const payload = {
+        note: 'Live sample of get_toilet_by_station("新宿"). Get a free key at https://api.gachi-tokusuru.com to query any station via MCP.',
+        ...found,
+        attribution: tool.attribution,
+      };
+      return Response.json(payload, { headers: { 'access-control-allow-origin': '*' } });
     }
 
     // Self-serve free key
@@ -216,16 +228,20 @@ export default {
 
     // MCP endpoint
     if (request.method === 'POST' && url.pathname === '/mcp') {
-      const auth = await resolveAuth(request, env);
-      if (!auth.ok) {
-        return Response.json(rpcError(null, -32001, 'unauthorized: get a free key at ' + UPGRADE_URL), { status: 401 });
-      }
       let body;
       try { body = await request.json(); } catch {
         return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 });
       }
-      // meter only the billable data calls
+      // Introspection (initialize / tools/list / notifications) is open — no key needed,
+      // so any client or directory can discover the tools. Only tools/call needs a key + metering.
       if (body?.method === 'tools/call') {
+        const auth = await resolveAuth(request, env);
+        if (!auth.ok) {
+          return Response.json(
+            rpcError(body.id ?? null, -32001, 'unauthorized: get a free key at ' + UPGRADE_URL),
+            { status: 401 },
+          );
+        }
         const m = await meterUsage(env, auth.token, auth.plan);
         if (!m.allowed) {
           return Response.json(
@@ -277,22 +293,28 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 11 multipurpose toilets, mapped to their <b>nearest station exit</b> — a first-party value you won't find in any raw dataset.
 </div>
 
+<p><a href="/example" target="_blank" rel="noopener"><b>▶ See a live sample response</b></a> — no key needed, opens real JSON in your browser.</p>
+
 <h2>Coverage</h2>
 <ul>
 <li><b>526 Tokyo stations</b> — accessible toilets with floor, gender, equipment &amp; <code>nearest_exit</code></li>
 <li><b>612 municipalities</b> nationwide — public toilets with wheelchair / baby-seat / ostomate flags</li>
 </ul>
 
+<h2>Built with this data</h2>
+<p><a href="https://toilet.gachi-tokusuru.com/en" target="_blank" rel="noopener">toilet.gachi-tokusuru.com</a> — a live site built entirely on this dataset. Your app can do the same in one API call.</p>
+
 <h2>Pricing <span class="mut">(early-access — early users are grandfathered)</span></h2>
 <table>
 <tr><th>Plan</th><th>Price</th><th>Limit</th><th></th></tr>
-<tr><td class="price">Free</td><td>$0</td><td>1,000 req / mo</td><td>MCP + REST access</td></tr>
-<tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>Connect to your agent at scale</td></tr>
+<tr><td class="price">Free</td><td>$0</td><td>1,000 req / mo</td><td>MCP access — evaluate &amp; hobby projects</td></tr>
+<tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>MCP access — production use in your agent/app</td></tr>
 <tr><td class="price">Business</td><td>Contact</td><td>—</td><td>Station master (cross-operator), ridership trends &amp; bulk datasets — <i>in development</i></td></tr>
 </table>
 <p><a href="#bizform">Upgrade to Pro — $19/mo →</a> <span class="mut">(early access: contact us below and we'll set you up)</span></p>
 
 <h2>Get a free API key</h2>
+<p class="mut">Enter your email — your key is issued instantly on this page (1,000 req/mo, no card required).</p>
 <form id="keyform">
 <input type="email" id="kemail" placeholder="you@example.com" required>
 <button type="submit">Get free key</button>
@@ -313,7 +335,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <pre>curl -X POST https://api.gachi-tokusuru.com/mcp \\
   -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"get_toilet_by_station","arguments":{"station":"新宿"}}}'</pre>
+       "params":{"name":"get_toilet_by_station","arguments":{"station":"Shinjuku"}}}'</pre>
 
 <h2>Start Pro, or ask about Business / bulk data</h2>
 <p class="mut">Want Pro ($19/mo) or the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
