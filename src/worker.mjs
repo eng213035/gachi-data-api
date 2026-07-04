@@ -1,0 +1,342 @@
+// Japan Toilet & Accessibility MCP — lean MVP
+// - Multi-key auth (self-serve free keys stored in KV)
+// - Per-plan monthly rate limiting (KV counter; eventually consistent = approximate, fine for MVP)
+// - English landing page + free-key form + Business interest form
+// Data served straight from Cloudflare KV. Hosted service — see README.
+
+const PLAN_LIMITS = { free: 1000, pro: 100000, admin: Infinity };
+
+const TOOLS = [
+  {
+    name: 'get_toilet_by_station',
+    description:
+      'Look up wheelchair-accessible / multipurpose toilets inside a Tokyo train station, ' +
+      'including floor, gender, equipment (wheelchair, ostomate, diaper table) and the nearest exit. ' +
+      'Covers 526 Tokyo stations. Accepts Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for major stations.',
+    prefix: 'toilet:',
+    argName: 'station',
+    attribution: {
+      source: 'Tokyo Metropolitan Government, Bureau of Social Welfare (wheelchair-accessible toilet dataset)',
+      license: 'CC BY 4.0',
+      derived: 'nearest_exit is an original value computed by gachi-tokusuru.com via spatial join',
+      romaji: 'English station names via ODPT (Public Transportation Open Data Center)',
+      provider: 'https://toilet.gachi-tokusuru.com',
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        station: {
+          type: 'string',
+          description: 'Station name in Japanese (新宿, 渋谷) or romaji for major stations (Shinjuku, Shibuya, Kita-Senju).',
+        },
+      },
+      required: ['station'],
+    },
+  },
+  {
+    name: 'get_public_toilet_by_city',
+    description:
+      'List public toilets in a Japanese municipality, with wheelchair / baby-seat / ostomate flags, ' +
+      'address and coordinates. Covers 612 municipalities nationwide (large cities capped at the top 50 results). ' +
+      'Municipality names accept Japanese (e.g. 那覇市, 渋谷区); prefixing the prefecture improves accuracy.',
+    prefix: 'wc:',
+    argName: 'city',
+    attribution: {
+      source: 'BODIK nationwide public-toilet open data (aggregated from Japanese municipalities)',
+      license: 'CC BY 4.0 (or equivalent municipal open-data terms)',
+      provider: 'https://toilet.gachi-tokusuru.com',
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        city: {
+          type: 'string',
+          description: 'Municipality name in Japanese (e.g. 那覇市, 渋谷区, 上天草市). Prefix the prefecture for accuracy.',
+        },
+      },
+      required: ['city'],
+    },
+  },
+];
+
+async function lookup(env, prefix, query) {
+  const exact = await env.TOILET_KV.get(`${prefix}${query}`, 'json');
+  if (exact) return exact;
+
+  // romaji alias: "Shinjuku" / "Kita-Senju" -> 日本語駅名 (station prefix only)
+  if (prefix === 'toilet:' && /[a-zA-Z]/.test(query)) {
+    const norm = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const ja = await env.TOILET_KV.get(`romaji:${norm}`);
+    if (ja) {
+      const viaRomaji = await env.TOILET_KV.get(`${prefix}${ja}`, 'json');
+      if (viaRomaji) return viaRomaji;
+    }
+  }
+
+  const { keys } = await env.TOILET_KV.list({ prefix });
+  const hit = keys.find((k) => {
+    const name = k.name.slice(prefix.length);
+    return name.includes(query) || query.includes(name);
+  });
+  return hit ? env.TOILET_KV.get(hit.name, 'json') : null;
+}
+
+function rpcResult(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+function rpcError(id, code, message) {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// ---- API key store (KV) --------------------------------------------------
+function randToken(prefix) {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${prefix}${hex}`;
+}
+
+async function resolveAuth(request, env) {
+  const auth = request.headers.get('authorization') || '';
+  const [scheme, token] = auth.split(' ');
+  if (scheme !== 'Bearer' || !token) return { ok: false };
+  // admin/master key (env secret) — unlimited, for internal testing
+  if (env.API_KEY && timingSafeEqual(token, env.API_KEY)) {
+    return { ok: true, plan: 'admin', token };
+  }
+  const record = await env.TOILET_KV.get(`key:${token}`, 'json');
+  if (!record || record.status !== 'active') return { ok: false };
+  return { ok: true, plan: record.plan || 'free', token };
+}
+
+function monthKey() {
+  return new Date().toISOString().slice(0, 7); // YYYY-MM (UTC)
+}
+
+// returns { allowed, used, limit }
+async function meterUsage(env, token, plan) {
+  const limit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
+  if (limit === Infinity) return { allowed: true, used: 0, limit };
+  const k = `usage:${token}:${monthKey()}`;
+  const used = parseInt((await env.TOILET_KV.get(k)) || '0', 10);
+  if (used >= limit) return { allowed: false, used, limit };
+  // ~35 day TTL so old counters self-expire
+  await env.TOILET_KV.put(k, String(used + 1), { expirationTtl: 3024000 });
+  return { allowed: true, used: used + 1, limit };
+}
+
+async function issueFreeKey(env, email) {
+  const token = randToken('gk_free_');
+  const record = { plan: 'free', email, status: 'active', created: new Date().toISOString() };
+  await env.TOILET_KV.put(`key:${token}`, JSON.stringify(record));
+  // bump a simple issuance counter (KPI)
+  const c = parseInt((await env.TOILET_KV.get('stat:keys_issued')) || '0', 10);
+  await env.TOILET_KV.put('stat:keys_issued', String(c + 1));
+  return token;
+}
+
+async function saveInterest(env, email, useCase) {
+  const id = randToken('int_');
+  await env.TOILET_KV.put(
+    `interest:${id}`,
+    JSON.stringify({ email, use_case: useCase, created: new Date().toISOString() }),
+  );
+}
+
+// ---- MCP JSON-RPC --------------------------------------------------------
+async function handleRpc(body, env) {
+  const { id, method, params } = body;
+
+  if (method === 'initialize') {
+    return rpcResult(id, {
+      protocolVersion: '2025-06-18',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'gachi-japan-toilet-mcp', version: '0.3.0' },
+    });
+  }
+  if (method === 'notifications/initialized') return null;
+  if (method === 'tools/list') {
+    return rpcResult(id, { tools: TOOLS.map(({ prefix, argName, attribution, ...t }) => t) });
+  }
+  if (method === 'tools/call') {
+    const tool = TOOLS.find((t) => t.name === params?.name);
+    if (!tool) return rpcError(id, -32602, `unknown tool: ${params?.name}`);
+    const query = params?.arguments?.[tool.argName];
+    const found = query ? await lookup(env, tool.prefix, query) : null;
+    const payload = found
+      ? { ...found, attribution: tool.attribution }
+      : { error: `No data found for "${query}".`, attribution: tool.attribution };
+    return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+  }
+  return rpcError(id, -32601, `method not found: ${method}`);
+}
+
+const UPGRADE_URL = 'https://api.gachi-tokusuru.com'; // landing page with pricing + Pro contact
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // Landing page
+    if (request.method === 'GET' && url.pathname === '/') {
+      return new Response(LANDING_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+
+    // Self-serve free key
+    if (request.method === 'POST' && url.pathname === '/keys') {
+      let b;
+      try { b = await request.json(); } catch { return Response.json({ error: 'invalid json' }, { status: 400 }); }
+      const email = (b?.email || '').trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+        return Response.json({ error: 'valid email required' }, { status: 400 });
+      }
+      const token = await issueFreeKey(env, email);
+      return Response.json({ api_key: token, plan: 'free', monthly_limit: PLAN_LIMITS.free });
+    }
+
+    // Business interest form
+    if (request.method === 'POST' && url.pathname === '/interest') {
+      let b;
+      try { b = await request.json(); } catch { return Response.json({ error: 'invalid json' }, { status: 400 }); }
+      const email = (b?.email || '').trim();
+      const useCase = (b?.use_case || '').trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !useCase) {
+        return Response.json({ error: 'email and use_case required' }, { status: 400 });
+      }
+      await saveInterest(env, email, useCase);
+      return Response.json({ ok: true });
+    }
+
+    // MCP endpoint
+    if (request.method === 'POST' && url.pathname === '/mcp') {
+      const auth = await resolveAuth(request, env);
+      if (!auth.ok) {
+        return Response.json(rpcError(null, -32001, 'unauthorized: get a free key at ' + UPGRADE_URL), { status: 401 });
+      }
+      let body;
+      try { body = await request.json(); } catch {
+        return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 });
+      }
+      // meter only the billable data calls
+      if (body?.method === 'tools/call') {
+        const m = await meterUsage(env, auth.token, auth.plan);
+        if (!m.allowed) {
+          return Response.json(
+            rpcError(body.id ?? null, -32002,
+              `monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade to Pro: ${UPGRADE_URL}`),
+            { status: 429, headers: { 'retry-after': '3600' } },
+          );
+        }
+      }
+      const result = await handleRpc(body, env);
+      if (result === null) return new Response(null, { status: 202 });
+      return Response.json(result);
+    }
+
+    return new Response('not found', { status: 404 });
+  },
+};
+
+const LANDING_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Japan Toilet & Accessibility API / MCP</title>
+<style>
+:root{--fg:#1a1a1a;--mut:#666;--acc:#0b6;--bg:#fff;--card:#f6f8f7;--bd:#e3e8e6}
+*{box-sizing:border-box}body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg)}
+.wrap{max-width:760px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:30px;line-height:1.2;margin:0 0 8px}h2{font-size:20px;margin:40px 0 12px}
+.sub{color:var(--mut);font-size:18px;margin:0 0 24px}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+pre{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;overflow-x:auto;font-size:13px}
+.demo{background:#0c1;background:linear-gradient(135deg,#0b6,#093);color:#fff;border-radius:10px;padding:18px 20px;margin:20px 0}
+.demo b{font-size:18px}
+table{width:100%;border-collapse:collapse;margin:8px 0}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--bd);vertical-align:top}
+.price{font-size:22px;font-weight:700}
+.tag{display:inline-block;background:#eef6f2;color:var(--acc);border:1px solid #bfe6d5;border-radius:99px;font-size:12px;padding:2px 10px;margin-left:6px}
+form{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin:12px 0}
+input,textarea{width:100%;padding:10px;border:1px solid var(--bd);border-radius:6px;font:inherit;margin:6px 0}
+button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
+.out{font-size:13px;margin-top:8px;white-space:pre-wrap;word-break:break-all}
+.mut{color:var(--mut);font-size:13px}a{color:var(--acc)}
+footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(--bd);padding-top:16px}
+</style></head><body><div class="wrap">
+
+<h1>Japan Toilet &amp; Accessibility API <span class="tag">Early access</span></h1>
+<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as REST and <b>MCP</b>.</p>
+
+<div class="demo">
+<b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
+11 multipurpose toilets, mapped to their <b>nearest station exit</b> — a first-party value you won't find in any raw dataset.
+</div>
+
+<h2>Coverage</h2>
+<ul>
+<li><b>526 Tokyo stations</b> — accessible toilets with floor, gender, equipment &amp; <code>nearest_exit</code></li>
+<li><b>612 municipalities</b> nationwide — public toilets with wheelchair / baby-seat / ostomate flags</li>
+</ul>
+
+<h2>Pricing <span class="mut">(early-access — early users are grandfathered)</span></h2>
+<table>
+<tr><th>Plan</th><th>Price</th><th>Limit</th><th></th></tr>
+<tr><td class="price">Free</td><td>$0</td><td>1,000 req / mo</td><td>MCP + REST access</td></tr>
+<tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>Connect to your agent at scale</td></tr>
+<tr><td class="price">Business</td><td>Contact</td><td>—</td><td>Station master (cross-operator), ridership trends &amp; bulk datasets — <i>in development</i></td></tr>
+</table>
+<p><a href="#bizform">Upgrade to Pro — $19/mo →</a> <span class="mut">(early access: contact us below and we'll set you up)</span></p>
+
+<h2>Get a free API key</h2>
+<form id="keyform">
+<input type="email" id="kemail" placeholder="you@example.com" required>
+<button type="submit">Get free key</button>
+<div class="out" id="kout"></div>
+</form>
+
+<h2>Connect from an MCP client (Claude Desktop / Claude Code)</h2>
+<pre>{
+  "mcpServers": {
+    "japan-toilet": {
+      "url": "https://api.gachi-tokusuru.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_API_KEY" }
+    }
+  }
+}</pre>
+
+<h2>Try it with curl</h2>
+<pre>curl -X POST https://api.gachi-tokusuru.com/mcp \\
+  -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"get_toilet_by_station","arguments":{"station":"新宿"}}}'</pre>
+
+<h2>Start Pro, or ask about Business / bulk data</h2>
+<p class="mut">Want Pro ($19/mo) or the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
+<form id="bizform">
+<input type="email" id="bemail" placeholder="you@example.com" required>
+<textarea id="buse" rows="2" placeholder="What would you use it for? (1 line)" required></textarea>
+<button type="submit">Contact us</button>
+<div class="out" id="bout"></div>
+</form>
+
+<footer>
+Data: Tokyo Metropolitan Government &amp; BODIK municipal open data (CC BY 4.0). <code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.
+</footer>
+
+<script>
+document.getElementById('keyform').onsubmit=async(e)=>{e.preventDefault();
+ const o=document.getElementById('kout');o.textContent='...';
+ const r=await fetch('/keys',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('kemail').value})});
+ const j=await r.json();
+ o.textContent=j.api_key?('Your key: '+j.api_key+'\\n(1,000 req/mo. Keep it safe.)'):('Error: '+(j.error||'failed'));};
+document.getElementById('bizform').onsubmit=async(e)=>{e.preventDefault();
+ const o=document.getElementById('bout');o.textContent='...';
+ const r=await fetch('/interest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('bemail').value,use_case:document.getElementById('buse').value})});
+ const j=await r.json();o.textContent=j.ok?'Thanks — we\\'ll be in touch.':('Error: '+(j.error||'failed'));};
+</script>
+</div></body></html>`;

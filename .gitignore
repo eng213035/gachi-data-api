@@ -1,0 +1,8 @@
+# never publish data pipeline, seeds, DB, or secrets
+build_kv_seed*.py
+kv_seed*.json
+*.db
+.api_key
+secrets/
+.wrangler/
+node_modules/
