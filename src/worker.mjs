@@ -6,10 +6,10 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'a30b7d1',
-  built: '2026-07-05T03:36:44Z',
-  build: 'phase3-5tier+rest+activate',
-  pricing_tiers: 5,
+  commit: 'pending',
+  built: '2026-07-05T04:14:08Z',
+  build: 'remove-enterprise-4tier',
+  pricing_tiers: 4,
 };
 
 const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
@@ -801,7 +801,7 @@ const LLMS_TXT = `# Gachi Japan Toilet & Accessibility API / MCP
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - Auth: Authorization: Bearer <key>. Free keys: https://api.gachi-tokusuru.com
 - OpenAPI: https://api.gachi-tokusuru.com/openapi.yaml
-- Pricing: https://api.gachi-tokusuru.com (Free 1k, Pro $19/100k, All Access $49/200k, Business $149/500k, Enterprise bulk)
+- Pricing: https://api.gachi-tokusuru.com (Free 1k, Pro $19/100k, All Access $49/200k, Business $149/500k)
 
 ## Free open datasets (citable, annually updated)
 - Japan Station Master (entity-resolved, 425 stations) + Ridership 2000-2025 (station_id shared)
@@ -891,11 +891,6 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
   <td><i>For teams and companies</i><br>Team key sharing (multiple seats) · embed in your company's products &amp; internal systems (no redistribution of raw data) · all current + upcoming APIs included<br>
   ${payCta('business', "your API key is issued instantly after checkout.")}</td>
 </tr>
-<tr>
-  <td class="price">Enterprise</td><td>from $2,500/yr</td><td>Bulk</td>
-  <td><i>Bulk data &amp; redistribution rights</i><br>Full dataset exports (Parquet/CSV): station master, ridership, accessibility, hazard · commercial redistribution license · annual data updates included · invoice billing available · best-effort email support<br>
-  <a href="#bizform"><button type="button">Contact us</button></a></td>
-</tr>
 </table>
 <p class="mut">Free, Pro and All Access are licensed to a single individual developer — commercial projects welcome. Teams and companies, please use Business or above.</p>
 <p class="mut">Already subscribed? <a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription</a> anytime.</p>
@@ -941,8 +936,8 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
 </ul>
 <p class="mut">The newest survey year reaches API subscribers first; it lands in the free dataset at the next annual release.</p>
 
-<h2 id="bizform-anchor">Business / Enterprise inquiry</h2>
-<p class="mut">For bulk dataset exports, redistribution rights, or team use — tell us what you'd use it for and we'll follow up. Upcoming APIs (station master, ridership, hazard) are included in the relevant plans <b>as they launch</b>.</p>
+<h2 id="bizform-anchor">Questions or a custom need?</h2>
+<p class="mut">Have a use case the plans above don't cover, or a question about the data? Tell us what you'd use it for — it shapes what we build next. Upcoming APIs (station master, ridership, hazard) are included in the relevant plans <b>as they launch</b>.</p>
 <form id="bizform">
 <input type="email" id="bemail" placeholder="you@example.com" required>
 <textarea id="buse" rows="2" placeholder="What would you use it for? (1 line)" required></textarea>

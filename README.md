@@ -46,7 +46,7 @@ curl -X POST https://api.gachi-tokusuru.com/mcp \
 
 ## Pricing
 
-Free 1k · Pro $19/100k · All Access $49/200k · Business $149/500k · Enterprise (bulk exports + redistribution) — from $2,500/yr. Full details: https://api.gachi-tokusuru.com
+Free 1k · Pro $19/100k · All Access $49/200k · Business $149/500k. Full details: https://api.gachi-tokusuru.com
 
 Paid plans are self-serve: after Stripe checkout the customer is redirected to `/activate?session_id=…`, which verifies payment, resolves the plan from the paid amount, and issues the API key on the page (idempotent per session — reload shows the same key). No manual key handling.
 
