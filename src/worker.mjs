@@ -548,9 +548,12 @@ export default {
       return new Response(LLMS_TXT, { headers: { 'content-type': 'text/plain; charset=utf-8', ...CORS } });
     }
 
-    // Landing page
+    // Landing page. no-cache so browsers/edge always revalidate — the page is a
+    // small dynamic Worker response and must never show a stale pricing table.
     if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(LANDING_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+      return new Response(LANDING_HTML, {
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache, must-revalidate' },
+      });
     }
 
     if (request.method === 'GET' && url.pathname === '/robots.txt') {
