@@ -1409,6 +1409,20 @@ export default {
             { status: 401 },
           );
         }
+        // Context API tools honour the same Free 1-municipality/day preview gate as REST.
+        const toolName = body?.params?.name;
+        if (auth.plan === 'free' && (toolName === 'get_municipality_context' || toolName === 'get_station_context')) {
+          const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+          const dk = `ctxday:${auth.token}:${day}`;
+          const dused = parseInt((await env.TOILET_KV.get(dk)) || '0', 10);
+          if (dused >= 1) {
+            return Response.json(
+              rpcError(body.id ?? null, -32003, `Context API preview is 1 municipality/day on Free — upgrade for unlimited: ${UPGRADE_URL}`),
+              { status: 429, headers: { 'retry-after': '86400' } },
+            );
+          }
+          await env.TOILET_KV.put(dk, String(dused + 1), { expirationTtl: 172800 });
+        }
         const m = await meterUsage(env, auth.token, auth.plan);
         if (!m.allowed) {
           return Response.json(
@@ -1746,7 +1760,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 > Free tier; MCP + REST share one key.
 
 ## API access
-- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city, get_station_hazard, get_active_alerts, get_station_alerts, get_train_status)
+- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_municipality_context, get_station_context, get_toilet_by_station, get_public_toilet_by_city, get_station_hazard, get_active_alerts, get_station_alerts, get_train_status)
 - REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
