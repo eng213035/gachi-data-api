@@ -4,7 +4,7 @@
 > Get a free API key at **https://api.gachi-tokusuru.com** and connect to the remote endpoint below.
 > The source in this repo is published for transparency; the data lives in the hosted backend, so a local clone will not return data.
 
-Clean, structured **Japan station & accessibility data** for AI agents — available as an **MCP server**, a **REST API**, and free **open datasets**. One key works for both the API and MCP.
+**Deep, obscure Japanese data you won't find anywhere else** — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents. Available as an **MCP server**, a **REST API**, and free **open datasets**. One key works for both the API and MCP.
 
 - **526 Tokyo stations** — accessible / multipurpose toilets with floor, gender, equipment flags (wheelchair, ostomate, diaper table) and the **nearest station exit** (an original first-party value computed by spatial join — not in any raw dataset).
 - **612 municipalities nationwide** — public toilets with wheelchair / baby-seat / ostomate flags, address and coordinates.

@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'd8ec832',
-  built: '2026-07-05T05:30:00Z',
-  build: 'lp-roadmap-section',
+  commit: '1c809c1',
+  built: '2026-07-05T05:40:00Z',
+  build: 'brand-deep-obscure-jp-data',
   pricing_tiers: 4,
 };
 
@@ -617,7 +617,11 @@ async function handleRpc(body, env) {
     return rpcResult(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'gachi-japan-toilet-mcp', version: '0.3.0' },
+      serverInfo: {
+        name: 'gachi-japan-toilet-mcp',
+        version: '0.3.0',
+        description: "Deep, obscure Japanese data you won't find anywhere else — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents.",
+      },
     });
   }
   if (method === 'notifications/initialized') return null;
@@ -944,11 +948,11 @@ info:
   title: Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
   version: "1.0.0"
   description: >
-    Structured data on wheelchair-accessible toilets in Tokyo train stations
-    and public toilets across Japan. Same data and response shape as the MCP
-    server. Auth: Authorization: Bearer <API key> (free keys at
-    https://api.gachi-tokusuru.com). Requests count against one shared monthly
-    quota per key (MCP + REST combined).
+    Deep, obscure Japanese data you won't find anywhere else — stations, accessibility,
+    vacancy, hazards. Hand-verified, English-first, built for AI agents. Same data and
+    response shape as the MCP server. Auth: Authorization: Bearer <API key> (free keys at
+    https://api.gachi-tokusuru.com). Requests count against one shared monthly quota per
+    key (MCP + REST combined).
 servers:
   - url: https://api.gachi-tokusuru.com
 paths:
@@ -1047,9 +1051,9 @@ Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded
 
 const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
 
-> Clean, structured data on wheelchair-accessible toilets in Tokyo train stations
-> (with nearest station exit) and public toilets across Japan. For AI agents,
-> travel and accessibility apps. Free tier; MCP + REST share one key.
+> Deep, obscure Japanese data you won't find anywhere else — stations, accessibility,
+> vacancy, hazards. Hand-verified, English-first, built for AI agents.
+> Free tier; MCP + REST share one key.
 
 ## API access
 - MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city, get_station_hazard)
@@ -1076,9 +1080,9 @@ const LANDING_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Gachi Data API — Japan Station &amp; Accessibility Data (API · MCP · Open Datasets)</title>
-<meta name="description" content="Japan's station & accessibility data — clean, English-first, built for AI agents. MCP server, REST API, and free open datasets (station master, ridership). One key works for everything.">
+<meta name="description" content="Deep, obscure Japanese data you won't find anywhere else — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents. MCP server + REST API + free open datasets.">
 <meta property="og:title" content="Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)">
-<meta property="og:description" content="Japan's station & accessibility data for AI agents — MCP server, REST API, and free open datasets. One key works for everything.">
+<meta property="og:description" content="Deep, obscure Japanese data you won't find anywhere else — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://api.gachi-tokusuru.com">
 <meta name="twitter:card" content="summary">
@@ -1088,7 +1092,8 @@ const LANDING_HTML = `<!doctype html>
 *{box-sizing:border-box}body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg)}
 .wrap{max-width:760px;margin:0 auto;padding:32px 20px 64px}
 h1{font-size:30px;line-height:1.2;margin:0 0 8px}h2{font-size:20px;margin:40px 0 12px}
-.sub{color:var(--mut);font-size:18px;margin:0 0 24px}
+.sub{color:var(--mut);font-size:18px;margin:0 0 16px}
+.tagline{font-style:italic;color:var(--fg);border-left:3px solid var(--acc);padding-left:12px;margin:0 0 24px}
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 pre{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;overflow-x:auto;font-size:13px}
 .demo{background:#0c1;background:linear-gradient(135deg,#0b6,#093);color:#fff;border-radius:10px;padding:18px 20px;margin:20px 0}
@@ -1105,7 +1110,8 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </style></head><body><div class="wrap">
 
 <h1>Gachi Data API <span class="tag">Early access</span></h1>
-<p class="sub">Japan's station &amp; accessibility data — clean, English-first, built for AI agents. Available as an <b>MCP</b> server, a <b>REST</b> API, and free <b>open datasets</b>. One key works for everything.</p>
+<p class="sub">Deep, obscure Japanese data you won't find anywhere else — station accessibility, vacancy statistics, hazard categories. Small, hand-verified, English-first, built for AI agents. <b>MCP</b> server + <b>REST</b> API + free <b>open datasets</b>. One key for everything.</p>
+<p class="tagline">We'd rather ship 425 verified stations than 10,000 unverified ones.</p>
 
 <div class="demo">
 <b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
