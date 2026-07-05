@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'realtime-layer',
-  built: '2026-07-05T11:11:28Z',
-  build: 'realtime-jma-alerts-and-train-status',
+  commit: 'v2-nationwide-vacancy-context',
+  built: '2026-07-05T15:10:41Z',
+  build: 'v2-nationwide-9145-vacancy-context-api',
   pricing_tiers: 4,
 };
 
@@ -34,6 +34,34 @@ const PAYMENT_LINKS = {
 };
 
 const TOOLS = [
+  {
+    name: 'get_municipality_context',
+    description:
+      'Official Japanese government data for any municipality, one call — housing vacancy (2003–2023), ' +
+      'nearest-station ridership trend, hazard categories, land prices, livability counts. ' +
+      'No scores, no judgment — official values only. Accepts a 5-digit municipality code (13104) or an exact name (Shinjuku-ku / 新宿区).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name_or_code: { type: 'string', description: '5-digit 全国地方公共団体コード (e.g. 13104) or exact municipality name (Shinjuku-ku / 新宿区).' },
+        fields: { type: 'string', description: 'Optional comma-separated subset: vacancy,ridership,population,hazard,land_price,livability.' },
+      },
+      required: ['name_or_code'],
+    },
+  },
+  {
+    name: 'get_station_context',
+    description:
+      "Same official municipality data as get_municipality_context, resolved from a station: pass a Japan Station Master station_id (e.g. st_00001) and it returns the context for that station's municipality. Official values only — no scores.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        station_id: { type: 'string', description: 'Japan Station Master station_id (e.g. st_00001).' },
+        fields: { type: 'string', description: 'Optional comma-separated subset: vacancy,ridership,population,hazard,land_price,livability.' },
+      },
+      required: ['station_id'],
+    },
+  },
   {
     name: 'get_toilet_by_station',
     description:
@@ -609,7 +637,7 @@ async function issuePaidKey(env, plan, { email, customer, session }) {
 // on first issuance (a revisit hits the session cache and returns before reaching here).
 async function sendKeyEmail(env, { email, plan, key }) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: 'disabled_or_no_email' };
-  const from = env.MAIL_FROM || 'Gachi Data API <noreply@piachan.com>';
+  const from = env.MAIL_FROM || 'Gachi Data API <noreply@gachi-tokusuru.com>';
   const label = PLAN_META[plan]?.label || plan;
   const limit = (PLAN_LIMITS[plan] || 0).toLocaleString('en-US');
   const text =
@@ -622,7 +650,7 @@ async function sendKeyEmail(env, { email, plan, key }) {
     `  curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" -H "Authorization: Bearer ${key}"\n\n` +
     `Docs: https://api.gachi-tokusuru.com/docs\n` +
     `Manage or cancel: ${PORTAL_URL}\n` +
-    `Questions? contact@piachan.com`;
+    `Questions? contact@gachi-tokusuru.com`;
   try {
     const resp = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -724,6 +752,15 @@ async function handleRpc(body, env) {
     }
     if (tool.name === 'get_train_status') {
       const payload = await trainStatusPayload(env, params?.arguments?.query);
+      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    }
+    // Municipality Context API (Akiya Stage 2): official municipality data in one call.
+    if (tool.name === 'get_municipality_context' || tool.name === 'get_station_context') {
+      const a = params?.arguments || {};
+      const fields = parseCtxFields(a.fields);
+      const payload = tool.name === 'get_station_context'
+        ? await stationContextPayload(env, (a.station_id || '').trim(), fields)
+        : await municipalityContextByNameOrCode(env, (a.name_or_code || '').trim(), fields);
       return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
     }
     const query = params?.arguments?.[tool.argName];
@@ -873,6 +910,149 @@ async function restAuthAndMeter(request, env) {
   return { ok: true, auth };
 }
 
+// ============ Municipality Context API (Akiya Stage 2) ============
+// One call: official Japanese government data for a municipality (or a station's
+// municipality) — housing vacancy (own dataset), nearest-station ridership (own),
+// future population / hazard / land price (live MLIT reinfolib relay), livability
+// facility counts (own KV, precomputed). Official values + arithmetic derivations
+// ONLY — no synthetic scores, no judgment words (STRATEGY-AKIYA).
+const CTX_FIELDS = ['vacancy', 'ridership', 'population', 'hazard', 'land_price', 'livability'];
+const VACANCY_ATTR = { source: 'Housing and Land Survey (Statistics Bureau of Japan) via e-Stat', note: 'Official counts verbatim; vacancy_rate is computed (vacant_total/total_dwellings).', url: 'https://www.e-stat.go.jp/' };
+const RIDERSHIP_ATTR = { source: 'Public Transportation Open Data Center (ODPT)', note: 'Annual passenger journeys; change_* are arithmetic derivations.', url: 'https://www.odpt.org/' };
+const POP_ATTR = { source: '国土交通省 不動産情報ライブラリ XKT013 (将来推計人口メッシュ)', note: 'Future-population mesh relayed per request; change is arithmetic.', url: 'https://www.reinfolib.mlit.go.jp/' };
+const LANDPRICE_ATTR = { source: '国土交通省 不動産情報ライブラリ XPT002 (地価公示)', note: 'Official published land prices within 1 km of the centroid; averages are arithmetic.', url: 'https://www.reinfolib.mlit.go.jp/' };
+const BUSSTOP_ATTR = { source: '国土交通省 国土数値情報 P11 (バス停留所)', note: 'Bus stops within 1 km of the municipality centroid — density near the town centre, not whole-municipality coverage.', url: 'https://nlftp.mlit.go.jp/ksj/' };
+
+function ctxDist(la1, lo1, la2, lo2) {
+  const R = 6371000, r = Math.PI / 180;
+  const dp = (la2 - la1) * r, dl = (lo2 - lo1) * r;
+  const a = Math.sin(dp / 2) ** 2 + Math.cos(la1 * r) * Math.cos(la2 * r) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function parsePopulation(data, lat, lng) {
+  const feats = (data.features || []).filter((f) => { const c = f.geometry?.coordinates?.[0]?.[0]; if (!c) return true; return ctxDist(lat, lng, c[1], c[0]) <= 600; });
+  if (!feats.length) return { available: false, note: 'no population mesh at this point', source: POP_ATTR.source };
+  const sum = (k) => feats.reduce((s, f) => s + (parseFloat(f.properties?.[k]) || 0), 0);
+  const p25 = Math.round(sum('PT00_2025')), p50 = Math.round(sum('PT00_2050')), p70 = Math.round(sum('PT00_2070'));
+  return { total_2025: p25, total_2050: p50, total_2070: p70, change_2025_2050_pct: p25 > 0 ? Math.round((p50 - p25) / p25 * 1000) / 10 : null, source: POP_ATTR.source };
+}
+function parseLandPrice(data, lat, lng, year) {
+  const price = (f) => { const m = (f.properties?.u_current_years_price_ja || '').replace(/,/g, '').match(/\d+/); return m ? parseInt(m[0], 10) : 0; };
+  const feats = (data.features || []).filter((f) => { const c = f.geometry?.coordinates; return c && ctxDist(lat, lng, c[1], c[0]) <= 1000; });
+  const avg = (a) => (a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null);
+  const resid = feats.filter((f) => (f.properties?.use_category_name_ja || '').includes('住宅')).map(price).filter((p) => p > 0);
+  const all = feats.map(price).filter((p) => p > 0);
+  if (!all.length) return { available: false, year, note: 'no land-price sample within 1 km of the centroid', source: LANDPRICE_ATTR.source };
+  return { year, unit: 'JPY/m2', residential_avg: avg(resid), residential_samples: resid.length, all_avg: avg(all), all_samples: all.length, source: LANDPRICE_ATTR.source };
+}
+
+async function resolveMuniByCode(env, code) {
+  const muni = await env.TOILET_KV.get(`muni:${code}`, 'json');
+  if (muni) return { muni };
+  const xw = await env.TOILET_KV.get(`munixwalk:${code}`, 'json');
+  if (xw) {
+    const nm = await env.TOILET_KV.get(`muni:${xw.new_code}`, 'json');
+    if (nm) return { muni: nm, merged: { requested_code: code, merged_into: xw.new_code, merged_into_name: xw.new_name, merged_year: xw.merged_year } };
+    return { mergedError: xw };
+  }
+  return {};
+}
+
+async function buildContext(env, muni, fields) {
+  const want = (f) => !fields || fields.has(f);
+  const lat = muni.lat, lng = muni.lng, hasCoord = typeof lat === 'number' && typeof lng === 'number';
+  const out = { municipality: { code: muni.code, name: muni.name, name_ja: muni.name_ja, name_kana: muni.name_kana || null, pref: muni.pref, lat: hasCoord ? lat : null, lng: hasCoord ? lng : null } };
+  const attribution = [];
+  if (want('vacancy')) {
+    const years = Object.keys(muni.vacancy || {});
+    out.vacancy = years.length ? { series: muni.vacancy, source: VACANCY_ATTR.source } : { available: false, note: 'not tabulated in the Housing and Land Survey (sample survey; small municipalities are not broken out every year)', source: VACANCY_ATTR.source };
+    if (years.length) attribution.push(VACANCY_ATTR);
+  }
+  if (want('ridership')) {
+    if (muni.nearest_station_id) {
+      const rr = await env.TOILET_KV.get(`muniridership:${muni.nearest_station_id}`, 'json');
+      out.ridership = rr
+        ? { via_station: muni.nearest_station_id, station_distance_km: muni.station_distance_km, operators: rr.operators, source: RIDERSHIP_ATTR.source }
+        : { available: false, via_station: muni.nearest_station_id, station_distance_km: muni.station_distance_km, note: 'nearest station has no ridership series (ridership currently covers Greater Tokyo)' };
+      if (rr) attribution.push(RIDERSHIP_ATTR);
+    } else {
+      out.ridership = { available: false, note: 'no station within 30 km of this municipality, so there is no nearest-station ridership' };
+    }
+  }
+  const key = env.REINFOLIB_API_KEY;
+  const tile = hasCoord ? hazTile(lat, lng, 14) : null;
+  if (want('population')) {
+    if (hasCoord && key) { out.population = await cachedLayer(env, `muni_${muni.code}`, 'population', async () => parsePopulation(await reinfoLayer(env, 'XKT013', tile.x, tile.y), lat, lng)).catch(() => ({ available: false, note: 'population source lookup failed; try again later', source: POP_ATTR.source })); attribution.push(POP_ATTR); }
+    else out.population = { available: false, note: key ? 'no coordinates for this municipality' : 'population source is not configured', source: POP_ATTR.source };
+  }
+  if (want('hazard')) {
+    if (hasCoord && key) { out.hazard = await stationHazard(env, { id: `muni_${muni.code}`, lat, lng, pref: muni.pref }); out.hazard_disclaimer = HAZARD_DISCLAIMER; attribution.push(HAZARD_ATTRIBUTION); }
+    else out.hazard = { available: false, note: key ? 'no coordinates for this municipality' : 'hazard source is not configured' };
+  }
+  if (want('land_price')) {
+    if (hasCoord && key) { out.land_price = await cachedLayer(env, `muni_${muni.code}`, 'land_price', async () => parseLandPrice(await reinfoLayer(env, 'XPT002', tile.x, tile.y), lat, lng, 2024)).catch(() => ({ available: false, note: 'land-price source lookup failed; try again later', source: LANDPRICE_ATTR.source })); attribution.push(LANDPRICE_ATTR); }
+    else out.land_price = { available: false, note: key ? 'no coordinates for this municipality' : 'land-price source is not configured', source: LANDPRICE_ATTR.source };
+  }
+  if (want('livability')) {
+    const t = muni.livability?.transit || {};
+    out.livability = { transit: { nearest_station_km: t.nearest_station_km ?? null, bus_stops_within_1km: t.bus_stops_within_1km ?? null, bus_stops_basis: 'count within 1 km of the municipality centroid (representative point) — density near the town centre, not whole-municipality coverage' } };
+    if (t.bus_stops_within_1km != null) attribution.push(BUSSTOP_ATTR);
+  }
+  const seen = new Set();
+  out.attribution = attribution.filter((a) => !seen.has(a.source) && seen.add(a.source));
+  return out;
+}
+
+function parseCtxFields(raw) {
+  const s = (raw || '').trim();
+  if (!s) return null;
+  const set = new Set(s.split(',').map((x) => x.trim()).filter((f) => CTX_FIELDS.includes(f)));
+  return set.size ? set : null;
+}
+
+// Free = 1 municipality/day (ctxday:<token>:<yyyymmdd>); Pro+ = normal monthly metering.
+async function ctxAuthAndGate(request, env) {
+  const auth = await resolveAuth(request, env);
+  if (!auth.ok) return { error: restError('unauthorized', `Missing or invalid API key. Get a free key at ${UPGRADE_URL}`, 401) };
+  if (auth.plan === 'free') {
+    const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const k = `ctxday:${auth.token}:${day}`;
+    const used = parseInt((await env.TOILET_KV.get(k)) || '0', 10);
+    if (used >= 1) return { error: restError('rate_limit_exceeded', `Context API preview is 1 municipality/day on Free — upgrade for unlimited: ${UPGRADE_URL}`, 429, { 'retry-after': '86400' }) };
+    await env.TOILET_KV.put(k, String(used + 1), { expirationTtl: 172800 });
+  }
+  const m = await meterUsage(env, auth.token, auth.plan);
+  if (!m.allowed) return { error: restError('rate_limit_exceeded', `Monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade: ${UPGRADE_URL}`, 429, { 'retry-after': '3600' }) };
+  return { ok: true, auth };
+}
+
+async function municipalityContextPayload(env, code, fields) {
+  const r = await resolveMuniByCode(env, code);
+  if (r.mergedError) return { error: `Municipality ${code} was dissolved (merged into ${r.mergedError.new_code} ${r.mergedError.new_name} in ${r.mergedError.merged_year}) and the successor is not in the current master.`, merged_into: r.mergedError.new_code };
+  if (!r.muni) return { error: `Unknown municipality_code "${code}". Use a 5-digit 全国地方公共団体コード (e.g. 13104 for Shinjuku-ku).` };
+  const ctx = await buildContext(env, r.muni, fields);
+  if (r.merged) ctx.resolved_from = r.merged;
+  return ctx;
+}
+async function municipalityContextByNameOrCode(env, q, fields) {
+  const s = (q || '').trim();
+  if (!s) return { error: 'name_or_code is required (e.g. 13104 or Shinjuku-ku or 新宿区).' };
+  if (/^\d{5}$/.test(s)) return municipalityContextPayload(env, s, fields);
+  let code = await env.TOILET_KV.get(`muniname:${s}`);
+  if (!code) { const n = s.toLowerCase().replace(/[^a-z0-9]/g, ''); if (n) code = await env.TOILET_KV.get(`muniname:${n}`); }
+  if (!code) return { error: `No municipality found for "${s}". Try a 5-digit code (13104) or an exact name (Shinjuku-ku / 新宿区).` };
+  return municipalityContextPayload(env, code, fields);
+}
+async function stationContextPayload(env, stationId, fields) {
+  const sid = (stationId || '').trim();
+  const code = sid ? await env.TOILET_KV.get(`stamuni:${sid}`) : null;
+  if (!code) return { error: `Unknown station_id "${sid}" (Japan Station Master, e.g. st_00001), or it has no coordinates to resolve a municipality.` };
+  const sta = await env.TOILET_KV.get(`sta:${sid}`, 'json');
+  const ctx = await municipalityContextPayload(env, code, fields);
+  if (!ctx.error) ctx.resolved_via_station = { station_id: sid, name: sta?.n || null, name_ja: sta?.nj || null };
+  return ctx;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -906,6 +1086,24 @@ export default {
       let payload;
       try { payload = await hazardFromRec(env, rec); }
       catch (e) { return restError('upstream_error', `Hazard source lookup failed: ${e.message}`, 502); }
+      return restJson(payload);
+    }
+
+    // ---- Municipality Context API (Akiya Stage 2): official values, one call, no scores ----
+    const muniCtxMatch = url.pathname.match(/^\/v1\/municipalities\/([^/]+)\/context$/);
+    if (request.method === 'GET' && muniCtxMatch) {
+      const gate = await ctxAuthAndGate(request, env);
+      if (gate.error) return gate.error;
+      const payload = await municipalityContextByNameOrCode(env, decodeURIComponent(muniCtxMatch[1]), parseCtxFields(url.searchParams.get('fields')));
+      if (payload.error) return restError(payload.merged_into ? 'gone' : 'not_found', payload.error, payload.merged_into ? 410 : 404);
+      return restJson(payload);
+    }
+    const staCtxMatch = url.pathname.match(/^\/v1\/stations\/([^/]+)\/context$/);
+    if (request.method === 'GET' && staCtxMatch) {
+      const gate = await ctxAuthAndGate(request, env);
+      if (gate.error) return gate.error;
+      const payload = await stationContextPayload(env, decodeURIComponent(staCtxMatch[1]), parseCtxFields(url.searchParams.get('fields')));
+      if (payload.error) return restError('not_found', payload.error, 404);
       return restJson(payload);
     }
 
@@ -1135,7 +1333,7 @@ export default {
       const sid = url.searchParams.get('session_id') || '';
       const htmlHeaders = { 'content-type': 'text/html; charset=utf-8' };
       const fail = (body, status) => new Response(activatePage(
-        `<h1>Activate your API key</h1>${body}<p class="mut">Back to <a href="/">home &amp; pricing</a> · contact@piachan.com</p>`,
+        `<h1>Activate your API key</h1>${body}<p class="mut">Back to <a href="/">home &amp; pricing</a> · contact@gachi-tokusuru.com</p>`,
       ), { headers: htmlHeaders, status });
       if (!env.STRIPE_SECRET_KEY) return fail('<p>Activation is temporarily unavailable. Please contact support with your payment email.</p>', 500);
       if (!/^cs_[A-Za-z0-9_]+$/.test(sid)) {
@@ -1166,7 +1364,7 @@ export default {
         + '<p>MCP client config:</p>'
         + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">{"mcpServers":{"japan-toilet":{"url":"https://api.gachi-tokusuru.com/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}</pre>`
         + '<p class="mut">Full API docs: <a href="/docs">/docs</a>. This key works for both MCP and REST (shared monthly quota).</p>'
-        + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. Questions? contact@piachan.com</p>`,
+        + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. Questions? contact@gachi-tokusuru.com</p>`,
       ), { headers: htmlHeaders });
     }
 
@@ -1242,7 +1440,7 @@ function payCta(planKey, subscribeNote) {
 const OPENAPI_YAML = `openapi: 3.0.3
 info:
   title: Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
-  version: "1.0.0"
+  version: "2.0.0"
   description: >
     Deep, obscure Japanese data you won't find anywhere else — stations, accessibility,
     vacancy, hazards. Hand-verified, English-first, built for AI agents. Same data and
@@ -1282,6 +1480,36 @@ paths:
         "400": { description: Missing/invalid lat or lng }
         "401": { description: Missing/invalid API key }
         "429": { description: Monthly quota reached (Retry-After header) }
+  /v1/municipalities/{code}/context:
+    get:
+      summary: Official data for a municipality in one call (vacancy, ridership, hazard, land price, livability)
+      description: >
+        One call returns official Japanese government data for a municipality — housing
+        vacancy (2003–2023), nearest-station ridership trend, MLIT hazard categories, land
+        prices, and livability counts (incl. bus stops within 1 km of the municipality
+        centroid). Official values + arithmetic derivations only — no scores, no judgment.
+        Accepts a 5-digit code or exact name; dissolved codes resolve via the merger
+        crosswalk. Free plan: 1 municipality/day.
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string }, description: 5-digit municipality code (13104) or exact name. }
+        - { name: fields, in: query, required: false, schema: { type: string }, description: "Comma-separated subset: vacancy,ridership,population,hazard,land_price,livability." }
+      responses:
+        "200": { description: Municipality context (official values only) }
+        "401": { description: Missing/invalid API key }
+        "404": { description: Unknown municipality }
+        "410": { description: Municipality dissolved (response names the successor) }
+        "429": { description: Free daily limit or monthly quota reached }
+  /v1/stations/{id}/context:
+    get:
+      summary: Same municipality context, resolved from a station_id
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Station master station_id (e.g. st_00001). }
+        - { name: fields, in: query, required: false, schema: { type: string }, description: "Comma-separated subset (see /v1/municipalities/{code}/context)." }
+      responses:
+        "200": { description: Context for the station's municipality }
+        "401": { description: Missing/invalid API key }
+        "404": { description: Unknown station_id }
+        "429": { description: Free daily limit or monthly quota reached }
   /v1/stations/{id}/hazard:
     get:
       summary: Official hazard info at a station (live relay to MLIT reinfolib)
@@ -1291,7 +1519,7 @@ paths:
         storm-surge inundation-area presence — relayed verbatim (no derived score) and
         cached 14 days. Landslide & tsunami are license-restricted (一部非商用) and return
         available:false with a link to the official hazard maps. station_id comes from the
-        Japan Station Master (e.g. st_00001); 423 of 425 stations have coordinates.
+        Japan Station Master (e.g. st_00001); 9,143 of 9,145 stations have coordinates.
         NOT a substitute for official hazard maps.
       parameters:
         - name: id
@@ -1522,6 +1750,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 - REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
+- REST GET /v1/municipalities/{code}/context · /v1/stations/{station_id}/context  (Municipality Context API: vacancy 2003-2023 × nearest-station ridership × hazard × land price × livability, one call per municipality or station; official values only, no scores; Free 1 municipality/day)
 - Realtime Layer (live) — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts & landslide warnings, station-matched. Alert coverage: nationwide. Station-matching: Greater Tokyo (423 stations) — elsewhere, query by area code.
   - REST GET /v1/alerts/active · /v1/alerts/area/{code} · /v1/stations/{station_id}/alerts  (JMA river flood forecasts (levels 2-5) & landslide alerts ONLY — not general weather warnings, not earthquakes; each response has a coverage array; relay of official facts, not a warning we issue)
   - REST GET /v1/lines/status · /v1/lines/{line_id}/status · /v1/stations/{station_id}/lines/status  (ODPT train service status; enum normal/delayed/suspended/resumed)
@@ -1533,8 +1762,10 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 - Pricing: https://api.gachi-tokusuru.com (Free 1k, Pro $19/100k, All Access $49/200k, Business $149/500k)
 
 ## Free open datasets (citable, annually updated)
-- Japan Station Master (entity-resolved, 425 stations) + Ridership 2000-2025 (station_id shared)
-- Zenodo DOI: 10.5281/zenodo.21199500  (https://doi.org/10.5281/zenodo.21199500)
+- Japan Station Master (entity-resolved, 9,145 stations nationwide) + Ridership 2000-2025 (station_id shared)
+- Housing Vacancy 2003-2023 (1,653 municipalities, 5 national surveys, with merger crosswalk)
+- Municipality Context API (live): vacancy × ridership × hazard × land price × livability, per municipality or station — official values only, no scores
+- Zenodo DOI (concept, always latest): 10.5281/zenodo.21199500  (https://doi.org/10.5281/zenodo.21199500)
 - GitHub: https://github.com/eng213035/gachi-open-datasets
 - Kaggle: https://www.kaggle.com/datasets/takufujii/japan-station-master-and-ridership-2000-2025-tokyo
 
@@ -1583,7 +1814,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 
 <h1>Gachi Data API <span class="tag">Early access</span></h1>
 <p class="sub">Deep, obscure Japanese data you won't find anywhere else — station accessibility, vacancy statistics, hazard categories. Small, hand-verified, English-first, built for AI agents. <b>MCP</b> server + <b>REST</b> API + free <b>open datasets</b>. One key for everything.</p>
-<p class="tagline">We'd rather ship 425 verified stations than 10,000 unverified ones.</p>
+<p class="tagline">Every station verified against official sources — or transparently flagged. (name_source: odpt / wikidata / romanized)</p>
 
 <div class="demo">
 <b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
@@ -1597,13 +1828,12 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <h2>What's inside</h2>
 <ul>
 <li><b>Accessibility API (live)</b> — 526 Tokyo stations with floor, gender, equipment &amp; <code>nearest_exit</code>; 612 municipalities of public toilets nationwide</li>
-<li><b>Station Master (open dataset)</b> — 425 stations, entity-resolved across operators (Shinjuku = 6 companies, 1 ID), English names</li>
+<li><b>Station Master (open dataset)</b> — 9,145 stations, entity-resolved nationwide (Shinjuku = 6 companies, 1 ID), English names (name_source: odpt/wikidata/romanized)</li>
 <li><b>Ridership 2000–2025 (open dataset)</b> — 292 stations, annual series through the COVID collapse and recovery</li>
-<!-- Station Hazard is a LIVE API relay (REST GET /v1/stations/{id}/hazard + MCP get_station_hazard):
-     house policy is to relay official MLIT hazard values as-is — no derived scores, no raw redistribution. -->
-<li><b>Station Hazard API (live)</b> — official flood, liquefaction &amp; storm-surge categories from MLIT for <b>423 stations</b>, relayed live per station (REST + MCP); landslide &amp; tsunami link out to the official maps (license-restricted)</li>
+<li><b>Housing Vacancy (open dataset)</b> — 1,653 municipalities, 5 national surveys (2003–2023), official counts with merger crosswalk. The numbers behind Japan's 9-million-akiya story, finally citable.</li>
+<li><b>Municipality Context API (live)</b> — vacancy × ridership × hazard × land price × livability in one call, per municipality or station. Official values only — no scores.</li>
+<li><b>Station Hazard API (live)</b> — official flood, liquefaction &amp; storm-surge categories from MLIT for <b>9,143 stations</b>, relayed live per station (REST + MCP); landslide &amp; tsunami link out to the official maps (license-restricted)</li>
 <li><b>Realtime Layer (live)</b> — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts &amp; landslide warnings, station-matched. <b>The one thing you can't cache.</b></li>
-<li><b>More APIs launching on this data</b> — All Access subscribers get every new one automatically</li>
 </ul>
 
 <h2>Built with this data</h2>
@@ -1626,8 +1856,6 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 
 <h2>Roadmap</h2>
 <ul>
-<li><b>Nationwide station coverage</b> — expanding the station master beyond Greater Tokyo (hazard &amp; ridership grow with it)</li>
-<li><b>Akiya Intelligence</b> — municipality vacancy statistics (1998–2023) + a one-call context API: vacancy × ridership decline × hazard</li>
 <li><b>Seismic risk</b> — earthquake shaking categories per station</li>
 <li><b>General weather warnings</b> (storm, heavy rain, snow) — planned</li>
 </ul>
@@ -1694,8 +1922,8 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
   -H "Authorization: Bearer YOUR_API_KEY"</pre>
 
 <h2>Free open datasets</h2>
-<p>Prefer the raw data? Our station master &amp; ridership datasets are free, citable and annually updated —
-<b>station master (cross-operator, entity-resolved) &amp; ridership 2000–2025</b>.</p>
+<p>Prefer the raw data? Our datasets are free, citable and annually updated —
+<b>station master (9,145 stations, cross-operator, entity-resolved), ridership 2000–2025, and housing vacancy 2003–2023 (1,653 municipalities, with merger crosswalk)</b>.</p>
 <ul>
 <li><a href="${DATASETS.github}" target="_blank" rel="noopener">GitHub</a> — source + build pipeline</li>
 <li><a href="${DATASETS.zenodo_url}" target="_blank" rel="noopener">Zenodo</a> — DOI <code>${DATASETS.zenodo_doi}</code> (citable archive)</li>
@@ -1705,6 +1933,7 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
 
 <h2 id="bizform-anchor">Questions or a custom need?</h2>
 <p class="mut">Have a use case the plans above don't cover, or a question about the data? Tell us what you'd use it for — it shapes what we build next. Upcoming APIs (station master, ridership, hazard) are included in the relevant plans <b>as they launch</b>.</p>
+<p class="mut"><b>Listing sites &amp; relocation services:</b> enrich your akiya listings with context data — vacancy, ridership trend, hazard and livability per municipality in one call.</p>
 <form id="bizform">
 <input type="email" id="bemail" placeholder="you@example.com" required>
 <textarea id="buse" rows="2" placeholder="What would you use it for? (1 line)" required></textarea>
@@ -1713,7 +1942,7 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
 </form>
 
 <footer>
-<p><b><a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription →</a></b> (Pro subscribers) &nbsp;·&nbsp; contact@piachan.com</p>
+<p><b><a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription →</a></b> (Pro subscribers) &nbsp;·&nbsp; contact@gachi-tokusuru.com</p>
 <p>Data: Tokyo Metropolitan Government &amp; BODIK municipal open data (CC BY 4.0). <code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.</p>
 </footer>
 

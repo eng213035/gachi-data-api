@@ -8,7 +8,7 @@
 
 - **526 Tokyo stations** — accessible / multipurpose toilets with floor, gender, equipment flags (wheelchair, ostomate, diaper table) and the **nearest station exit** (an original first-party value computed by spatial join — not in any raw dataset).
 - **612 municipalities nationwide** — public toilets with wheelchair / baby-seat / ostomate flags, address and coordinates.
-- **Free open datasets** — Japan Station Master (entity-resolved, 425 stations) & Ridership 2000–2025, sharing one `station_id`: https://github.com/eng213035/gachi-open-datasets (Zenodo DOI `10.5281/zenodo.21199500`).
+- **Free open datasets** — Japan Station Master (entity-resolved, 9,145 stations nationwide) & Ridership 2000–2025, sharing one `station_id`: https://github.com/eng213035/gachi-open-datasets (Zenodo DOI `10.5281/zenodo.21199500`).
 
 Station names accept Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for major stations.
 
