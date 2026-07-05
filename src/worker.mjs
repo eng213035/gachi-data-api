@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'ffbfb5e',
-  built: '2026-07-05T05:55:00Z',
-  build: 'built-with-3cards-data-stories',
+  commit: 'f30b61c',
+  built: '2026-07-05T06:05:00Z',
+  build: 'built-with-www-pipeline-line',
   pricing_tiers: 4,
 };
 
@@ -1197,10 +1197,11 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <p>Rural infrastructure navigator: bus stops, hospitals, supermarkets, station access times. The same spatial engine that powers our livability data.</p>
 </div>
 <div class="card">
-<a href="https://gachi-tokusuru.com/" target="_blank" rel="noopener"><b>gachi-tokusuru.com</b></a>
+<a href="https://www.gachi-tokusuru.com/" target="_blank" rel="noopener"><b>www.gachi-tokusuru.com</b></a>
 <p>Our Japanese-language data journalism site. Daily analyses built on this exact pipeline: land price × future population, hazard × price per station, ridership rankings. <span class="mut">(Japanese only — the data behind it is what this API sells.)</span></p>
 </div>
 </div>
+<p>These sites run on the same pipeline you'd be buying — if they're updating daily, the data is alive.</p>
 
 <h2>Roadmap</h2>
 <ul>
