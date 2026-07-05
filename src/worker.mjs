@@ -20,9 +20,9 @@ const AMOUNT_TO_PLAN = { 1900: 'pro', 4900: 'all_access', 14900: 'business' };
 // Payment Links (Stripe). Pro is live; All Access / Business are placeholders the
 // operator fills in after creating the links in Stripe (Phase 5 human task).
 const PAYMENT_LINKS = {
-  pro: 'https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00',
+  pro: 'https://buy.stripe.com/cNi6oHaKhaZp8mJ6Rh3Ru04',
   all_access: 'https://buy.stripe.com/6oU8wP05D2sTdH36Rh3Ru02',
-  business: 'REPLACE_WITH_BUSINESS_PAYMENT_LINK',
+  business: 'https://buy.stripe.com/3cIbJ18C9d7xdH30sT3Ru03',
 };
 
 const TOOLS = [
