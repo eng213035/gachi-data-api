@@ -1,4 +1,4 @@
-// Japan Toilet & Accessibility MCP — lean MVP
+// Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets) — lean MVP
 // - Multi-key auth (self-serve free keys stored in KV)
 // - Per-plan monthly rate limiting (KV counter; eventually consistent = approximate, fine for MVP)
 // - English landing page + free-key form + Business interest form
@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'c0f7682',
-  built: '2026-07-05T04:14:08Z',
-  build: 'remove-enterprise-4tier',
+  commit: 'b184eaf',
+  built: '2026-07-05T04:22:35Z',
+  build: 'rebrand-gachi-data-api',
   pricing_tiers: 4,
 };
 
@@ -722,7 +722,7 @@ function payCta(planKey, subscribeNote) {
 
 const OPENAPI_YAML = `openapi: 3.0.3
 info:
-  title: Gachi Japan Toilet & Accessibility API
+  title: Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
   version: "1.0.0"
   description: >
     Structured data on wheelchair-accessible toilets in Tokyo train stations
@@ -771,11 +771,11 @@ security:
 `;
 
 const DOCS_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>API docs — Gachi Japan Toilet API</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>API docs — Gachi Data API</title>
 <style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#1a1a1a}
 code,pre{font-family:ui-monospace,Menlo,monospace}pre{background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:14px;overflow-x:auto;font-size:13px}
 a{color:#0b6}h2{margin-top:32px}</style></head><body>
-<h1>Gachi Japan Toilet &amp; Accessibility API — REST v1</h1>
+<h1>Gachi Data API — Japan Station &amp; Accessibility Data — REST v1</h1>
 <p>Machine-readable spec: <a href="/openapi.yaml">/openapi.yaml</a>. Get a free key at <a href="/">the homepage</a>.
 Auth header on every call: <code>Authorization: Bearer &lt;key&gt;</code>. MCP and REST share one monthly quota per key.</p>
 <h2>Station toilets (English or Japanese station name)</h2>
@@ -789,7 +789,7 @@ Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded
 <p><a href="/">← Back to home &amp; pricing</a></p>
 </body></html>`;
 
-const LLMS_TXT = `# Gachi Japan Toilet & Accessibility API / MCP
+const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
 
 > Clean, structured data on wheelchair-accessible toilets in Tokyo train stations
 > (with nearest station exit) and public toilets across Japan. For AI agents,
@@ -818,10 +818,10 @@ const LLMS_TXT = `# Gachi Japan Toilet & Accessibility API / MCP
 const LANDING_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Japan Toilet & Accessibility API / MCP</title>
-<meta name="description" content="Structured data on wheelchair-accessible & public toilets across Japan — 526 Tokyo stations (with nearest station exit) + 612 municipalities. MCP server, free tier. For AI agents, travel & accessibility apps.">
-<meta property="og:title" content="Japan Toilet & Accessibility API / MCP">
-<meta property="og:description" content="Wheelchair-accessible & public toilet data across Japan for AI agents. MCP server, free tier, live sample.">
+<title>Gachi Data API — Japan Station &amp; Accessibility Data (API · MCP · Open Datasets)</title>
+<meta name="description" content="Japan's station & accessibility data — clean, English-first, built for AI agents. MCP server, REST API, and free open datasets (station master, ridership). One key works for everything.">
+<meta property="og:title" content="Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)">
+<meta property="og:description" content="Japan's station & accessibility data for AI agents — MCP server, REST API, and free open datasets. One key works for everything.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://api.gachi-tokusuru.com">
 <meta name="twitter:card" content="summary">
@@ -847,24 +847,28 @@ button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:10px 
 footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(--bd);padding-top:16px}
 </style></head><body><div class="wrap">
 
-<h1>Japan Toilet &amp; Accessibility API <span class="tag">Early access</span></h1>
-<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as an <b>MCP</b> server and a <b>REST</b> API — one key works for both.</p>
+<h1>Gachi Data API <span class="tag">Early access</span></h1>
+<p class="sub">Japan's station &amp; accessibility data — clean, English-first, built for AI agents. Available as an <b>MCP</b> server, a <b>REST</b> API, and free <b>open datasets</b>. One key works for everything.</p>
 
 <div class="demo">
 <b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
-11 multipurpose toilets, mapped to their <b>nearest station exit</b> — a first-party value you won't find in any raw dataset.
+11 accessible toilets, each mapped to its <b>nearest station exit</b> — first-party data you won't find anywhere else.
 </div>
 
-<p><a href="/example" target="_blank" rel="noopener"><b>▶ See a live sample response</b></a> — no key needed, opens real JSON in your browser.</p>
+<p><a href="/example" target="_blank" rel="noopener"><b>▶ See a live sample response</b></a> — no key needed, real JSON.</p>
 
-<h2>Coverage</h2>
+<h2>What's inside</h2>
 <ul>
-<li><b>526 Tokyo stations</b> — accessible toilets with floor, gender, equipment &amp; <code>nearest_exit</code></li>
-<li><b>612 municipalities</b> nationwide — public toilets with wheelchair / baby-seat / ostomate flags</li>
+<li><b>Accessibility API (live)</b> — 526 Tokyo stations with floor, gender, equipment &amp; <code>nearest_exit</code>; 612 municipalities of public toilets nationwide</li>
+<li><b>Station Master (open dataset)</b> — 425 stations, entity-resolved across operators (Shinjuku = 6 companies, 1 ID), English names</li>
+<li><b>Ridership 2000–2025 (open dataset)</b> — 292 stations, annual series through the COVID collapse and recovery</li>
+<!-- TODO(Part B): when Station Hazard is published, drop "(open dataset — in preparation)" → "(open dataset)" and append its Zenodo DOI link, like the other datasets. See Part A-3 of the launch spec. -->
+<li><b>Station Hazard (open dataset — in preparation)</b> — flood, earthquake &amp; liquefaction risk, joined to the same station IDs</li>
+<li><b>More APIs launching on this data</b> — All Access subscribers get every new one automatically</li>
 </ul>
 
 <h2>Built with this data</h2>
-<p><a href="https://toilet.gachi-tokusuru.com/en" target="_blank" rel="noopener">toilet.gachi-tokusuru.com</a> — a live site built entirely on this dataset. Your app can do the same in one API call.</p>
+<p><a href="https://toilet.gachi-tokusuru.com/en" target="_blank" rel="noopener">toilet.gachi-tokusuru.com</a> — a live site running entirely on this dataset. Your agent can do the same in one call.</p>
 
 <h2>Pricing <span class="mut">(early-access — early users are grandfathered)</span></h2>
 <table>

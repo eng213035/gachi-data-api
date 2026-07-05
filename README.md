@@ -1,13 +1,14 @@
-# Japan Toilet & Accessibility — MCP Server
+# Gachi Data API — Japan Station & Accessibility Data (API · MCP · Open Datasets)
 
 > **This is a hosted service. You do NOT self-host it.**
 > Get a free API key at **https://api.gachi-tokusuru.com** and connect to the remote endpoint below.
-> The source in this repo is published for transparency; the toilet data lives in the hosted backend, so a local clone will not return data.
+> The source in this repo is published for transparency; the data lives in the hosted backend, so a local clone will not return data.
 
-An MCP server that gives AI agents clean, structured data on **wheelchair-accessible and public toilets in Japan** — for travel, accessibility, and inbound-tourism apps.
+Clean, structured **Japan station & accessibility data** for AI agents — available as an **MCP server**, a **REST API**, and free **open datasets**. One key works for both the API and MCP.
 
 - **526 Tokyo stations** — accessible / multipurpose toilets with floor, gender, equipment flags (wheelchair, ostomate, diaper table) and the **nearest station exit** (an original first-party value computed by spatial join — not in any raw dataset).
 - **612 municipalities nationwide** — public toilets with wheelchair / baby-seat / ostomate flags, address and coordinates.
+- **Free open datasets** — Japan Station Master (entity-resolved, 425 stations) & Ridership 2000–2025, sharing one `station_id`: https://github.com/eng213035/gachi-open-datasets (Zenodo DOI `10.5281/zenodo.21199500`).
 
 Station names accept Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for major stations.
 
