@@ -4,6 +4,14 @@
 // - English landing page + free-key form + Business interest form
 // Data served straight from KV (see build_kv_seed*.py). No D1/Stripe-webhook in this lean build.
 
+// Bumped on every deploy so /__version proves which build a given request hit.
+const BUILD_VERSION = {
+  commit: 'a30b7d1',
+  built: '2026-07-05T03:36:44Z',
+  build: 'phase3-5tier+rest+activate',
+  pricing_tiers: 5,
+};
+
 const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
 
 // Paid-plan metadata for key issuance + the activation success page.
@@ -495,6 +503,14 @@ export default {
     // CORS preflight for the REST API
     if (request.method === 'OPTIONS' && url.pathname.startsWith('/v1/')) {
       return new Response(null, { status: 204, headers: CORS });
+    }
+
+    // Build probe — cache-proof way to confirm which Worker version answered this request.
+    if (request.method === 'GET' && url.pathname === '/__version') {
+      return Response.json(
+        { ...BUILD_VERSION, colo: request.cf?.colo ?? null, served_by: 'gachi-toilet-mcp' },
+        { headers: { 'cache-control': 'no-cache, must-revalidate', ...CORS } },
+      );
     }
 
     // ---- REST v1 (thin layer over the same internal functions + i18n as MCP) ----
