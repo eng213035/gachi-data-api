@@ -46,7 +46,14 @@ curl -X POST https://api.gachi-tokusuru.com/mcp \
 
 ## Pricing
 
-Free: 1,000 req/mo · Pro: $19/mo (100,000 req/mo) · Business (cross-operator station master, ridership trends, bulk datasets) — in development. See https://api.gachi-tokusuru.com
+Free 1k · Pro $19/100k · All Access $49/200k · Business $149/500k · Enterprise (bulk exports + redistribution) — from $2,500/yr. Full details: https://api.gachi-tokusuru.com
+
+Paid plans are self-serve: after Stripe checkout the customer is redirected to `/activate?session_id=…`, which verifies payment, resolves the plan from the paid amount, and issues the API key on the page (idempotent per session — reload shows the same key). No manual key handling.
+
+## Operational notes (internal)
+
+- **Subscription cancellation is not yet wired to key revocation** (no Stripe webhook in this build). A cancelled subscriber's key keeps working until manually disabled. **Reconcile monthly**: compare Stripe's active subscriptions against issued `key:*` records and disable keys for lapsed subscribers. A `customer.subscription.deleted` webhook → auto-revoke is the next phase.
+- Plan detection in `/activate` is by paid amount (`AMOUNT_TO_PLAN`: $19/$49/$149). If a new plan reuses an existing amount, add an explicit mapping.
 
 ## Licensing (two layers — read carefully)
 

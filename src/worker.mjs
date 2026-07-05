@@ -6,6 +6,17 @@
 
 const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
 
+// Paid-plan metadata for key issuance + the activation success page.
+const PLAN_META = {
+  pro:        { prefix: 'gk_pro_', label: 'Pro',        stat: 'stat:pro_keys_issued' },
+  all_access: { prefix: 'gk_all_', label: 'All Access', stat: 'stat:all_access_keys_issued' },
+  business:   { prefix: 'gk_biz_', label: 'Business',   stat: 'stat:business_keys_issued' },
+};
+// Plan is detected from the paid amount (USD cents). $19/$49/$149 are distinct,
+// so this is unambiguous without needing Stripe price IDs (the restricted key
+// can't read them). If a future plan reuses an amount, add it here.
+const AMOUNT_TO_PLAN = { 1900: 'pro', 4900: 'all_access', 14900: 'business' };
+
 // Payment Links (Stripe). Pro is live; All Access / Business are placeholders the
 // operator fills in after creating the links in Stripe (Phase 5 human task).
 const PAYMENT_LINKS = {
@@ -332,38 +343,54 @@ async function issueFreeKey(env, email) {
   return token;
 }
 
-async function issueProKey(env, email) {
-  const token = randToken('gk_pro_');
-  const record = { plan: 'pro', email, status: 'active', created: new Date().toISOString() };
+async function issuePaidKey(env, plan, { email, customer, session }) {
+  const meta = PLAN_META[plan];
+  const token = randToken(meta.prefix);
+  const record = {
+    plan, email, status: 'active',
+    stripe_customer_id: customer || null,
+    stripe_session_id: session || null,
+    created: new Date().toISOString(),
+  };
   await env.TOILET_KV.put(`key:${token}`, JSON.stringify(record));
-  const c = parseInt((await env.TOILET_KV.get('stat:pro_keys_issued')) || '0', 10);
-  await env.TOILET_KV.put('stat:pro_keys_issued', String(c + 1));
+  const c = parseInt((await env.TOILET_KV.get(meta.stat)) || '0', 10);
+  await env.TOILET_KV.put(meta.stat, String(c + 1));
   return token;
 }
 
-// Verify a paid Stripe Checkout Session and hand back a Pro key (idempotent per session).
-async function activatePro(env, sessionId) {
+// Verify a paid Stripe Checkout Session and issue the plan's key (idempotent per session).
+// Plan is resolved from the paid amount (see AMOUNT_TO_PLAN). Works for Pro / All Access / Business.
+async function activate(env, sessionId) {
   const cached = await env.TOILET_KV.get(`session:${sessionId}`, 'json');
   if (cached) return { ok: true, ...cached }; // already activated → same key
 
-  const resp = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
-    headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
-  });
+  const resp = await fetch(
+    `https://api.stripe.com/v1/checkout/sessions/${sessionId}?expand[]=line_items`,
+    { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
+  );
   if (!resp.ok) return { ok: false, reason: 'verify_failed' };
   const s = await resp.json();
-  const paid = s.payment_status === 'paid' || s.status === 'complete';
-  if (!paid) return { ok: false, reason: 'not_paid' };
+  if (s.payment_status !== 'paid') return { ok: false, reason: 'not_paid' };
+
+  // Resolve plan from the line-item amount (fall back to the session amount_total).
+  const li = s.line_items?.data?.[0];
+  const amount = li?.price?.unit_amount ?? li?.amount_total ?? s.amount_total;
+  const plan = AMOUNT_TO_PLAN[amount];
+  if (!plan) {
+    console.log(`activate: unmapped amount ${amount} (session ${sessionId}) — add it to AMOUNT_TO_PLAN`);
+    return { ok: false, reason: 'unknown_plan' };
+  }
 
   const email = s.customer_details?.email || s.customer_email || '';
-  const key = await issueProKey(env, email);
-  const rec = { key, email };
+  const key = await issuePaidKey(env, plan, { email, customer: s.customer, session: sessionId });
+  const rec = { key, plan, email };
   await env.TOILET_KV.put(`session:${sessionId}`, JSON.stringify(rec));
   return { ok: true, ...rec };
 }
 
 function activatePage(body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Pro activation</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Activate your API key</title>
 <style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1a1a1a}
 code{background:#f6f8f7;border:1px solid #e3e8e6;border-radius:6px;padding:2px 6px;word-break:break-all}
 .key{display:block;background:#eef6f2;border:1px solid #bfe6d5;border-radius:8px;padding:14px;font-family:ui-monospace,Menlo,monospace;margin:12px 0;word-break:break-all}
@@ -564,32 +591,45 @@ export default {
       return Response.json(payload, { headers: { 'access-control-allow-origin': '*' } });
     }
 
-    // Pro activation — Stripe redirects here after a successful subscription checkout.
+    // Legacy /pro-activate → /activate (keep old payment-completion URLs working, preserve query)
     if (request.method === 'GET' && url.pathname === '/pro-activate') {
+      return Response.redirect(`${url.origin}/activate${url.search}`, 301);
+    }
+
+    // Activation — Stripe redirects here after any paid subscription checkout (Pro / All Access / Business).
+    if (request.method === 'GET' && url.pathname === '/activate') {
       const sid = url.searchParams.get('session_id') || '';
       const htmlHeaders = { 'content-type': 'text/html; charset=utf-8' };
+      const fail = (body, status) => new Response(activatePage(
+        `<h1>Activate your API key</h1>${body}<p class="mut">Back to <a href="/">home &amp; pricing</a> · contact@piachan.com</p>`,
+      ), { headers: htmlHeaders, status });
+      if (!env.STRIPE_SECRET_KEY) return fail('<p>Activation is temporarily unavailable. Please contact support with your payment email.</p>', 500);
       if (!/^cs_[A-Za-z0-9_]+$/.test(sid)) {
-        return new Response(activatePage(
-          '<h1>Pro activation</h1><p>Missing or invalid session. If you just paid and see this, contact support with your payment email.</p>'
-          + '<p class="mut">contact@piachan.com</p>'), { headers: htmlHeaders, status: 400 });
+        return fail('<p>Missing or invalid session. If you just paid and see this, contact support with your payment email.</p>', 403);
       }
-      const r = await activatePro(env, sid);
+      const r = await activate(env, sid);
       if (!r.ok) {
         const msg = r.reason === 'not_paid'
           ? 'Payment is not completed yet. If you just paid, refresh this page in a few seconds.'
-          : 'We could not verify your payment automatically. Please contact support with your payment email — we\'ll send your key.';
-        return new Response(activatePage(`<h1>Pro activation</h1><p>${msg}</p><p class="mut">contact@piachan.com</p>`),
-          { headers: htmlHeaders });
+          : r.reason === 'unknown_plan'
+            ? 'We could not match your purchase to a plan. Please contact support with your payment email.'
+            : 'We could not verify your payment automatically. Please contact support with your payment email.';
+        return fail(`<p>${msg}</p>`, 403);
       }
+      const label = PLAN_META[r.plan]?.label || r.plan;
+      const limit = (PLAN_LIMITS[r.plan] || 0).toLocaleString('en-US');
       return new Response(activatePage(
-        '<h1>✅ You\'re on Pro</h1>'
-        + '<p>Thanks for subscribing. Here is your Pro API key (100,000 requests/month):</p>'
+        `<h1>✅ You're on ${label}</h1>`
+        + `<p>Thanks for subscribing. Here is your API key (${limit} requests/month, MCP + REST):</p>`
         + `<code class="key">${r.key}</code>`
-        + '<p><b>Save it now</b> — treat it like a password. Use it as <code>Authorization: Bearer &lt;key&gt;</code> at '
-        + '<code>https://api.gachi-tokusuru.com/mcp</code>.</p>'
-        + '<p class="mut">A copy is tied to your subscription; reopening this page shows the same key.</p>'
-        + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. `
-        + 'Questions? contact@piachan.com</p>'), { headers: htmlHeaders });
+        + '<p><b>Save it now</b> — treat it like a password. <b>Bookmark this page</b> to see the same key again.</p>'
+        + '<p>First call:</p>'
+        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\\n  -H "Authorization: Bearer ${r.key}"</pre>`
+        + '<p>MCP client config:</p>'
+        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">{"mcpServers":{"japan-toilet":{"url":"https://api.gachi-tokusuru.com/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}</pre>`
+        + '<p class="mut">Full API docs: <a href="/docs">/docs</a>. This key works for both MCP and REST (shared monthly quota).</p>'
+        + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. Questions? contact@piachan.com</p>`,
+      ), { headers: htmlHeaders });
     }
 
     // Self-serve free key
@@ -825,12 +865,12 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <tr>
   <td class="price">All Access</td><td>$49/mo</td><td>200,000 / mo <span class="mut">(shared pool, fair use)</span></td>
   <td><i>Every API we ship, one key</i><br>All current + upcoming APIs (station master, ridership, hazard — <b>as they launch</b>), included automatically · single developer license<br>
-  ${payCta('all_access', "you'll receive your API key by email within 24 hours.")}</td>
+  ${payCta('all_access', "your API key is issued instantly after checkout.")}</td>
 </tr>
 <tr>
   <td class="price">Business</td><td>$149/mo</td><td>500,000 / mo <span class="mut">(shared pool)</span></td>
   <td><i>For teams and companies</i><br>Team key sharing (multiple seats) · embed in your company's products &amp; internal systems (no redistribution of raw data) · all current + upcoming APIs included<br>
-  ${payCta('business', "you'll receive your API key by email within 24 hours.")}</td>
+  ${payCta('business', "your API key is issued instantly after checkout.")}</td>
 </tr>
 <tr>
   <td class="price">Enterprise</td><td>from $2,500/yr</td><td>Bulk</td>
