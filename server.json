@@ -3,10 +3,10 @@
   "name": "com.gachi-tokusuru/japan-data-api",
   "title": "Gachi Data API — Japan Station & Accessibility Data",
   "description": "Deep, obscure Japanese station, accessibility & hazard data for AI agents. English-first.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "websiteUrl": "https://api.gachi-tokusuru.com",
   "repository": {
-    "url": "https://github.com/eng213035/japan-data-mcp",
+    "url": "https://github.com/eng213035/gachi-data-api",
     "source": "github"
   },
   "remotes": [
