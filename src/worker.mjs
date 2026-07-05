@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'f30b61c',
-  built: '2026-07-05T06:05:00Z',
-  build: 'built-with-www-pipeline-line',
+  commit: '10a814f',
+  built: '2026-07-05T10:36:00Z',
+  build: 'activate-copy-email-idempotent',
   pricing_tiers: 4,
 };
 
@@ -564,9 +564,43 @@ async function issuePaidKey(env, plan, { email, customer, session }) {
 
 // Verify a paid Stripe Checkout Session and issue the plan's key (idempotent per session).
 // Plan is resolved from the paid amount (see AMOUNT_TO_PLAN). Works for Pro / All Access / Business.
+// Email the freshly-issued key to the customer as a backup copy. Best-effort: never throws, and is
+// a no-op unless RESEND_API_KEY is configured (so activation works with or without email). The
+// /activate page stays the primary delivery. Idempotency is handled by the caller: this only runs
+// on first issuance (a revisit hits the session cache and returns before reaching here).
+async function sendKeyEmail(env, { email, plan, key }) {
+  if (!env.RESEND_API_KEY || !email) return { sent: false, reason: 'disabled_or_no_email' };
+  const from = env.MAIL_FROM || 'Gachi Data API <noreply@piachan.com>';
+  const label = PLAN_META[plan]?.label || plan;
+  const limit = (PLAN_LIMITS[plan] || 0).toLocaleString('en-US');
+  const text =
+    `You're on ${label} — thanks for subscribing to Gachi Data API.\n\n` +
+    `Your API key (${limit} requests/month, works for both MCP and REST):\n\n` +
+    `${key}\n\n` +
+    `Keep it safe — treat it like a password. If you lose it, reopen the activation page you were ` +
+    `redirected to after checkout (bookmark it) and it will show this same key.\n\n` +
+    `First call:\n` +
+    `  curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" -H "Authorization: Bearer ${key}"\n\n` +
+    `Docs: https://api.gachi-tokusuru.com/docs\n` +
+    `Manage or cancel: ${PORTAL_URL}\n` +
+    `Questions? contact@piachan.com`;
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to: [email], subject: `Your Gachi Data API key (${label})`, text }),
+    });
+    if (!resp.ok) console.log(`sendKeyEmail: resend HTTP ${resp.status}`);
+    return { sent: resp.ok, status: resp.status };
+  } catch (e) {
+    console.log(`sendKeyEmail error: ${e.message}`);
+    return { sent: false, reason: e.message };
+  }
+}
+
 async function activate(env, sessionId) {
   const cached = await env.TOILET_KV.get(`session:${sessionId}`, 'json');
-  if (cached) return { ok: true, ...cached }; // already activated → same key
+  if (cached) return { ok: true, ...cached }; // already activated → same key (no re-issue, no re-email)
 
   const resp = await fetch(
     `https://api.stripe.com/v1/checkout/sessions/${sessionId}?expand[]=line_items`,
@@ -587,7 +621,9 @@ async function activate(env, sessionId) {
 
   const email = s.customer_details?.email || s.customer_email || '';
   const key = await issuePaidKey(env, plan, { email, customer: s.customer, session: sessionId });
-  const rec = { key, plan, email };
+  // Backup delivery by email — only here on first issuance, so it never re-sends on a revisit.
+  const mail = await sendKeyEmail(env, { email, plan, key });
+  const rec = { key, plan, email, emailed: !!mail.sent };
   await env.TOILET_KV.put(`session:${sessionId}`, JSON.stringify(rec));
   return { ok: true, ...rec };
 }
@@ -598,7 +634,9 @@ function activatePage(body) {
 <style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#1a1a1a}
 code{background:#f6f8f7;border:1px solid #e3e8e6;border-radius:6px;padding:2px 6px;word-break:break-all}
 .key{display:block;background:#eef6f2;border:1px solid #bfe6d5;border-radius:8px;padding:14px;font-family:ui-monospace,Menlo,monospace;margin:12px 0;word-break:break-all}
-.mut{color:#666;font-size:14px}a{color:#0b6}</style></head><body>${body}</body></html>`;
+.mut{color:#666;font-size:14px}a{color:#0b6}
+button{background:#0b6;color:#fff;border:0;border-radius:6px;padding:9px 16px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.7}</style></head><body>${body}</body></html>`;
 }
 
 async function saveInterest(env, email, useCase) {
@@ -863,8 +901,12 @@ export default {
       return new Response(activatePage(
         `<h1>✅ You're on ${label}</h1>`
         + `<p>Thanks for subscribing. Here is your API key (${limit} requests/month, MCP + REST):</p>`
-        + `<code class="key">${r.key}</code>`
-        + '<p><b>Save it now</b> — treat it like a password. <b>Bookmark this page</b> to see the same key again.</p>'
+        + `<div class="key" id="apikey">${r.key}</div>`
+        + '<p><button type="button" id="copybtn" onclick="copyKey()">Copy key</button></p>'
+        + '<p><b>Save it now</b> — treat it like a password. <b>Bookmark this page (this exact URL).</b> '
+        + 'Reloading it shows the same key again — even if you close the tab before copying'
+        + (r.emailed ? ", and we've also emailed it to you as a backup." : '.') + '</p>'
+        + `<script>function copyKey(){var k=document.getElementById('apikey').textContent.trim();var b=document.getElementById('copybtn');function done(){b.textContent='Copied!';setTimeout(function(){b.textContent='Copy key';},2000);}function fb(){try{var r=document.createRange();r.selectNode(document.getElementById('apikey'));var s=window.getSelection();s.removeAllRanges();s.addRange(r);document.execCommand('copy');done();}catch(e){b.textContent='Select the key and press Ctrl+C';}}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(k).then(done).catch(fb);}else{fb();}}</script>`
         + '<p>First call:</p>'
         + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\\n  -H "Authorization: Bearer ${r.key}"</pre>`
         + '<p>MCP client config:</p>'
