@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: '1c809c1',
-  built: '2026-07-05T05:40:00Z',
-  build: 'brand-deep-obscure-jp-data',
+  commit: 'ffbfb5e',
+  built: '2026-07-05T05:55:00Z',
+  build: 'built-with-3cards-data-stories',
   pricing_tiers: 4,
 };
 
@@ -1046,6 +1046,55 @@ government/municipal hazard maps at <a href="https://disaportal.gsi.go.jp/">disa
 防災・避難の判断には必ず自治体の公式ハザードマップをご確認ください。</p>
 <p>Errors are JSON: <code>{"error":"&lt;code&gt;","message":"...","docs":"https://api.gachi-tokusuru.com/docs"}</code>.
 Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded (with <code>Retry-After</code>).</p>
+<h2 id="data-stories">Data Stories</h2>
+<p>Two worked examples. Every number below is a real API response or a row from the open datasets — nothing is invented, and there's no interpretation on top.</p>
+
+<h3>Two hubs, very different water</h3>
+<p>Two of Tokyo's busiest interchange hubs sit about 13&nbsp;km apart. Shinjuku reads as no flood category; Musashi-Kosugi carries 0.5–3.0&nbsp;m of expected inundation from the Tama River. The station name doesn't tell you which — one call per station does.</p>
+<pre>GET /v1/stations/st_00167/hazard          # Shinjuku (新宿)
+{
+  "station": { "id": "st_00167", "name": "Shinjuku", "name_ja": "新宿" },
+  "hazard": {
+    "flood":        { "inundation_expected": false, "depth_category": "none",
+                      "rivers": null,
+                      "source": "国土交通省 不動産情報ライブラリ XKT026 (洪水浸水想定区域・想定最大規模)" },
+    "liquefaction": { "landform_ja": "ローム台地", "tendency_level": 5,
+                      "tendency_note_ja": "液状化しにくい" }
+  }
+}
+
+GET /v1/stations/st_00388/hazard          # Musashi-kosugi (武蔵小杉)
+{
+  "station": { "id": "st_00388", "name": "Musashi-kosugi", "name_ja": "武蔵小杉" },
+  "hazard": {
+    "flood":        { "inundation_expected": true, "depth_category": "0.5–3.0 m",
+                      "rivers": ["多摩川", "大栗川", "浅川"],
+                      "source": "国土交通省 不動産情報ライブラリ XKT026 (洪水浸水想定区域・想定最大規模)" },
+    "liquefaction": { "landform_ja": "後背湿地", "tendency_level": 3,
+                      "tendency_note_ja": "やや液状化しやすい" }
+  }
+}</pre>
+<p>One call per station. Official MLIT categories, no interpretation.</p>
+
+<h3>Ridership: the shock and the incomplete return</h3>
+<p>Official annual ridership doesn't move the way you'd guess. At Chuo-Daigaku-Meisei-Daigaku on the Tama Monorail, daily journeys held near 34,000 through 2019, fell to 5,917 in 2020, and have climbed back only to about 16% below 2012. You can read the whole curve — and join it to hazard — per station.</p>
+<pre># station-ridership open dataset (station_ridership.csv) — station_id st_00068
+year    passenger_journeys
+2012        33,118
+2019        33,675
+2020         5,917
+2022        29,320
+2024        27,913
+# operator: Tokyo Tama Intercity Monorail · includes_alighting: true</pre>
+<p>Cross it against the same station's hazard in one lookup:</p>
+<pre>GET /v1/stations/st_00068/hazard
+{ "hazard": { "flood": { "depth_category": "0.5–3.0 m" },
+              "liquefaction": { "landform_ja": "丘陵" } } }</pre>
+<!-- TODO(Context API / Stage 2): once GET /v1/stations/{id}/context ships, replace the two-step
+     (ridership open dataset + hazard API) above with a single context call returning
+     vacancy × ridership × hazard × population, and update this Data Story's example accordingly. -->
+<p>Ridership from the open dataset, hazard from the API — joined on one <code>station_id</code>. The Context API will fold vacancy × ridership × hazard × population into a single call: next on the roadmap.</p>
+
 <p><a href="/">← Back to home &amp; pricing</a></p>
 </body></html>`;
 
@@ -1062,6 +1111,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
 - Auth: Authorization: Bearer <key>. Free keys: https://api.gachi-tokusuru.com
 - OpenAPI: https://api.gachi-tokusuru.com/openapi.yaml
+- Example analyses (Data Stories): https://api.gachi-tokusuru.com/docs#data-stories
 - Pricing: https://api.gachi-tokusuru.com (Free 1k, Pro $19/100k, All Access $49/200k, Business $149/500k)
 
 ## Free open datasets (citable, annually updated)
@@ -1094,6 +1144,10 @@ const LANDING_HTML = `<!doctype html>
 h1{font-size:30px;line-height:1.2;margin:0 0 8px}h2{font-size:20px;margin:40px 0 12px}
 .sub{color:var(--mut);font-size:18px;margin:0 0 16px}
 .tagline{font-style:italic;color:var(--fg);border-left:3px solid var(--acc);padding-left:12px;margin:0 0 24px}
+.cards{display:grid;grid-template-columns:1fr;gap:12px;margin:12px 0}
+@media(min-width:640px){.cards{grid-template-columns:1fr 1fr 1fr}}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px}
+.card p{margin:8px 0 0;font-size:14px}
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 pre{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;overflow-x:auto;font-size:13px}
 .demo{background:#0c1;background:linear-gradient(135deg,#0b6,#093);color:#fff;border-radius:10px;padding:18px 20px;margin:20px 0}
@@ -1132,7 +1186,21 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </ul>
 
 <h2>Built with this data</h2>
-<p><a href="https://toilet.gachi-tokusuru.com/en" target="_blank" rel="noopener">toilet.gachi-tokusuru.com</a> — a live site running entirely on this dataset. Your agent can do the same in one call.</p>
+<p class="mut">Three live products, one data pipeline — we eat our own cooking.</p>
+<div class="cards">
+<div class="card">
+<a href="https://toilet.gachi-tokusuru.com/en" target="_blank" rel="noopener"><b>toilet.gachi-tokusuru.com</b></a>
+<p>A live accessibility site running entirely on this dataset. Your agent can do the same in one call.</p>
+</div>
+<div class="card">
+<a href="https://infra.gachi-tokusuru.com/" target="_blank" rel="noopener"><b>infra.gachi-tokusuru.com</b></a>
+<p>Rural infrastructure navigator: bus stops, hospitals, supermarkets, station access times. The same spatial engine that powers our livability data.</p>
+</div>
+<div class="card">
+<a href="https://gachi-tokusuru.com/" target="_blank" rel="noopener"><b>gachi-tokusuru.com</b></a>
+<p>Our Japanese-language data journalism site. Daily analyses built on this exact pipeline: land price × future population, hazard × price per station, ridership rankings. <span class="mut">(Japanese only — the data behind it is what this API sells.)</span></p>
+</div>
+</div>
 
 <h2>Roadmap</h2>
 <ul>
