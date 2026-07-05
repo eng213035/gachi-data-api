@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: '10a814f',
-  built: '2026-07-05T10:36:00Z',
-  build: 'activate-copy-email-idempotent',
+  commit: 'realtime-layer',
+  built: '2026-07-05T11:11:28Z',
+  build: 'realtime-jma-alerts-and-train-status',
   pricing_tiers: 4,
 };
 
@@ -104,6 +104,45 @@ const TOOLS = [
         },
       },
       required: ['station_name'],
+    },
+  },
+  {
+    name: 'get_active_alerts',
+    description:
+      'Live river flood forecasts and landslide alerts for Japan (JMA official). ' +
+      'NOT general weather warnings (storm/heavy rain/snow) and NOT earthquakes. Covers JMA ' +
+      '指定河川洪水予報 (river flood forecast, levels 2–5) and 土砂災害警戒情報 (landslide warning), each with ' +
+      'level, affected area, official summary and issue time. Optional `area` filters by 2-digit ' +
+      'prefecture code (e.g. 13 = Tokyo) or a JMA forecast-area code. Relay of official facts — not a ' +
+      'warning issued by this service, not a life-safety system.',
+    inputSchema: {
+      type: 'object',
+      properties: { area: { type: 'string', description: 'Optional prefecture code (01–47, e.g. 13 = Tokyo) or JMA forecast-area code.' } },
+    },
+  },
+  {
+    name: 'get_station_alerts',
+    description:
+      "Live JMA river flood forecasts and landslide alerts affecting a station's prefecture — NOT general " +
+      'weather warnings. Ask by station name in Japanese (新宿) or romaji (Shinjuku). Prefecture-level match ' +
+      '(station master is Greater Tokyo). Relay of official JMA facts.',
+    inputSchema: {
+      type: 'object',
+      properties: { station_name: { type: 'string', description: 'Station name in Japanese (新宿) or romaji (Shinjuku).' } },
+      required: ['station_name'],
+    },
+  },
+  {
+    name: 'get_train_status',
+    description:
+      'Live train service status for Tokyo-area lines — delays, suspensions, resumptions. ' +
+      "Ask 'is the Yamanote Line running?' by line or station name, English or Japanese. " +
+      'Status enum: normal / delayed / suspended / resumed. Cause text relayed from ODPT (English summary ' +
+      'for known patterns, else original text + null). Data via ODPT (CC BY 4.0).',
+    inputSchema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Line or station name (English or Japanese), e.g. "Yamanote" or "新宿".' } },
+      required: ['query'],
     },
   },
 ];
@@ -674,6 +713,19 @@ async function handleRpc(body, env) {
       const payload = await hazardPayload(env, params?.arguments?.station_name);
       return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
     }
+    // Realtime relays (KV snapshots written by the host pipelines).
+    if (tool.name === 'get_active_alerts') {
+      const payload = await activeAlertsPayload(env, (params?.arguments?.area || '').trim() || null);
+      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    }
+    if (tool.name === 'get_station_alerts') {
+      const payload = await stationAlertsPayload(env, params?.arguments?.station_name);
+      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    }
+    if (tool.name === 'get_train_status') {
+      const payload = await trainStatusPayload(env, params?.arguments?.query);
+      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    }
     const query = params?.arguments?.[tool.argName];
     const found = query ? await lookup(env, tool.prefix, query) : null;
     let payload;
@@ -717,6 +769,88 @@ function restError(code, message, status, extraHeaders = {}) {
 }
 function restJson(payload) {
   return Response.json(payload, { headers: { ...CORS } });
+}
+
+// ---- Realtime layer (JMA alerts + ODPT train status) ---------------------
+// Relayed from official feeds; the one thing you can't cache. Host pipelines write
+// fresh snapshots into KV (alerts:active, train:status:_all) with a `fetched_at`;
+// the Worker never returns stale data with a fresh face — it flags `stale` when the
+// snapshot is older than the poll cadence allows, or 503s when the key is missing.
+const ALERTS_MAX_AGE_S = 1500; // JMA pipeline runs every 10 min → stale after 25 min
+const TRAIN_MAX_AGE_S = 600;   // ODPT poller runs every ~3 min → stale after 10 min
+
+const JMA_DISCLAIMER =
+  'Source: Japan Meteorological Agency. Relayed as published — not a warning issued by ' +
+  'this service. For evacuation decisions always follow official municipal guidance. ' +
+  'Best-effort relay, not a life-safety system.';
+const JMA_ATTR = { source: 'Japan Meteorological Agency (気象庁)', official_url: 'https://www.jma.go.jp/bosai/' };
+// What this feed DOES cover — stated in every alert response so callers never assume
+// it is general weather warnings. It is NOT general weather warnings (storm / heavy
+// rain / snow) and NOT earthquakes; those are out of scope (see /docs).
+const ALERTS_COVERAGE = ['river_flood_forecast (JMA levels 2-5)', 'landslide_warning'];
+const ODPT_ATTR = {
+  source: 'Public Transportation Open Data Center (ODPT)',
+  provider: 'Association for Open Data of Public Transportation',
+  license: 'CC BY 4.0',
+};
+
+// English prefecture name (station master) → 2-digit code, for prefecture-level
+// station↔alert matching. Full 47 so it also works if coverage widens past Kanto.
+const PREF_EN_CODE = {
+  Hokkaido:'01',Aomori:'02',Iwate:'03',Miyagi:'04',Akita:'05',Yamagata:'06',Fukushima:'07',
+  Ibaraki:'08',Tochigi:'09',Gunma:'10',Saitama:'11',Chiba:'12',Tokyo:'13',Kanagawa:'14',
+  Niigata:'15',Toyama:'16',Ishikawa:'17',Fukui:'18',Yamanashi:'19',Nagano:'20',Gifu:'21',
+  Shizuoka:'22',Aichi:'23',Mie:'24',Shiga:'25',Kyoto:'26',Osaka:'27',Hyogo:'28',Nara:'29',
+  Wakayama:'30',Tottori:'31',Shimane:'32',Okayama:'33',Hiroshima:'34',Yamaguchi:'35',
+  Tokushima:'36',Kagawa:'37',Ehime:'38',Kochi:'39',Fukuoka:'40',Saga:'41',Nagasaki:'42',
+  Kumamoto:'43',Oita:'44',Miyazaki:'45',Kagoshima:'46',Okinawa:'47',
+};
+
+// Read a realtime KV snapshot with a freshness verdict. { missing } if absent.
+async function readRealtime(env, key, maxAgeSec) {
+  const data = await env.TOILET_KV.get(key, 'json');
+  if (!data) return { missing: true };
+  const t = data.fetched_at ? Date.parse(data.fetched_at) : NaN;
+  const ageSec = Number.isFinite(t) ? (Date.now() - t) / 1000 : Infinity;
+  return { data, fetched_at: data.fetched_at || null, stale: ageSec > maxAgeSec, age_sec: Math.round(ageSec) };
+}
+
+// MCP payload builders (shared shape with the REST routes).
+async function activeAlertsPayload(env, area) {
+  const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+  if (r.missing) return { error: 'Alert feed is not initialized yet.', attribution: JMA_ATTR };
+  let alerts = r.data.alerts || [];
+  if (area) alerts = alerts.filter((a) => a.area_code === area || a.pref_code === area);
+  return { coverage: ALERTS_COVERAGE, fetched_at: r.fetched_at, stale: r.stale, count: alerts.length, alerts, source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER };
+}
+async function stationAlertsPayload(env, name) {
+  const rec = name ? await resolveStationByName(env, name) : null;
+  if (!rec) return { error: `No station matched "${name}".`, attribution: JMA_ATTR };
+  const prefCode = PREF_EN_CODE[rec.pref] || null;
+  const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+  if (r.missing) return { error: 'Alert feed is not initialized yet.', attribution: JMA_ATTR };
+  const alerts = prefCode ? (r.data.alerts || []).filter((a) => a.pref_code === prefCode) : [];
+  return { station: { name: rec.n, name_ja: rec.nj, pref: rec.pref || null }, match: 'prefecture-level', coverage: ALERTS_COVERAGE, fetched_at: r.fetched_at, stale: r.stale, count: alerts.length, alerts, source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER };
+}
+async function trainStatusPayload(env, query) {
+  const r = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+  if (r.missing) return { error: 'Train status feed is not initialized yet.', attribution: ODPT_ATTR };
+  const lines = r.data.lines || {};
+  const raw = (query || '').trim();
+  if (!raw) return { error: 'query required', attribution: ODPT_ATTR };
+  const q = raw.toLowerCase();
+  const lineMatches = Object.values(lines).filter((l) =>
+    (l.line_en && l.line_en.toLowerCase().includes(q)) || (l.line_ja && l.line_ja.includes(raw)));
+  if (lineMatches.length) return { query: raw, fetched_at: r.fetched_at, stale: r.stale, count: lineMatches.length, lines: lineMatches, attribution: ODPT_ATTR };
+  const rec = await resolveStationByName(env, raw);
+  if (rec) {
+    const ids = await env.TOILET_KV.get(`stalines:${rec.id}`, 'json');
+    if (ids) {
+      const sl = ids.map((id) => lines[id]).filter(Boolean);
+      return { query: raw, station: { name: rec.n, name_ja: rec.nj }, fetched_at: r.fetched_at, stale: r.stale, count: sl.length, lines: sl, attribution: ODPT_ATTR };
+    }
+  }
+  return { query: raw, count: 0, lines: [], note: 'No line or station matched.', attribution: ODPT_ATTR };
 }
 
 // Auth + shared metering for REST (same key + same monthly counter as MCP).
@@ -812,6 +946,90 @@ export default {
       });
     }
 
+    // ---- Realtime: JMA alerts (relay of official published alerts) ----
+    if (request.method === 'GET' && url.pathname === '/v1/alerts/active') {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Alert feed is not initialized yet.', 503);
+      return restJson({
+        coverage: ALERTS_COVERAGE,
+        fetched_at: r.fetched_at, stale: r.stale, count: r.data.count ?? r.data.alerts?.length ?? 0,
+        alerts: r.data.alerts || [], source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER,
+      });
+    }
+    const alertAreaMatch = url.pathname.match(/^\/v1\/alerts\/area\/([^/]+)$/);
+    if (request.method === 'GET' && alertAreaMatch) {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const code = decodeURIComponent(alertAreaMatch[1]);
+      const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Alert feed is not initialized yet.', 503);
+      // Match either a JMA forecast-area code or a 2-digit prefecture code.
+      const alerts = (r.data.alerts || []).filter((a) => a.area_code === code || a.pref_code === code);
+      return restJson({
+        area_code: code, coverage: ALERTS_COVERAGE, fetched_at: r.fetched_at, stale: r.stale, count: alerts.length,
+        alerts, source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER,
+      });
+    }
+    const stationAlertsMatch = url.pathname.match(/^\/v1\/stations\/([^/]+)\/alerts$/);
+    if (request.method === 'GET' && stationAlertsMatch) {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const stationId = decodeURIComponent(stationAlertsMatch[1]);
+      const sta = await env.TOILET_KV.get(`sta:${stationId}`, 'json');
+      if (!sta) return restError('not_found', `Unknown station_id "${stationId}" (Japan Station Master, e.g. st_00001).`, 404);
+      const prefCode = PREF_EN_CODE[sta.pref] || null;
+      const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Alert feed is not initialized yet.', 503);
+      const alerts = prefCode ? (r.data.alerts || []).filter((a) => a.pref_code === prefCode) : [];
+      return restJson({
+        station: { station_id: stationId, name: sta.n, name_ja: sta.nj, pref: sta.pref || null },
+        match: 'prefecture-level (station master is Greater Tokyo; precise area-level matching is planned)',
+        coverage: ALERTS_COVERAGE,
+        fetched_at: r.fetched_at, stale: r.stale, count: alerts.length, alerts,
+        source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER,
+      });
+    }
+
+    // ---- Realtime: ODPT train service status ----
+    if (request.method === 'GET' && url.pathname === '/v1/lines/status') {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const r = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Train status feed is not initialized yet.', 503);
+      const lines = Object.values(r.data.lines || {});
+      return restJson({
+        fetched_at: r.fetched_at, stale: r.stale, count: lines.length, lines, attribution: ODPT_ATTR,
+      });
+    }
+    const lineStatusMatch = url.pathname.match(/^\/v1\/lines\/([^/]+)\/status$/);
+    if (request.method === 'GET' && lineStatusMatch) {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const lineId = decodeURIComponent(lineStatusMatch[1]);
+      const r = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Train status feed is not initialized yet.', 503);
+      const one = (r.data.lines || {})[lineId];
+      if (!one) return restError('not_found', `Unknown line_id "${lineId}" (e.g. odpt.Railway:JR-East.Yamanote).`, 404);
+      return restJson({ fetched_at: r.fetched_at, stale: r.stale, line: one, attribution: ODPT_ATTR });
+    }
+    const stationLinesMatch = url.pathname.match(/^\/v1\/stations\/([^/]+)\/lines\/status$/);
+    if (request.method === 'GET' && stationLinesMatch) {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const stationId = decodeURIComponent(stationLinesMatch[1]);
+      const lineIds = await env.TOILET_KV.get(`stalines:${stationId}`, 'json');
+      if (!lineIds) return restError('not_found', `Unknown station_id "${stationId}" or no lines mapped.`, 404);
+      const r = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+      if (r.missing) return restError('unavailable', 'Train status feed is not initialized yet.', 503);
+      const lines = lineIds.map((id) => (r.data.lines || {})[id]).filter(Boolean);
+      return restJson({
+        station: { station_id: stationId }, fetched_at: r.fetched_at, stale: r.stale,
+        count: lines.length, lines, attribution: ODPT_ATTR,
+      });
+    }
+
     // OpenAPI spec + a tiny docs page pointing at it
     if (request.method === 'GET' && url.pathname === '/openapi.yaml') {
       return new Response(OPENAPI_YAML, { headers: { 'content-type': 'application/yaml; charset=utf-8', ...CORS } });
@@ -869,6 +1087,42 @@ export default {
         attribution: tool.attribution,
       };
       return Response.json(payload, { headers: { 'access-control-allow-origin': '*' } });
+    }
+
+    // No-auth LIVE demos of the realtime layer (real data, trimmed). Rate-protected
+    // by a 60s edge cache (Cache-Control) so anonymous traffic can't hammer the Worker.
+    if (request.method === 'GET' && url.pathname === '/example/train-status') {
+      const demoHeaders = { 'access-control-allow-origin': '*', 'cache-control': 'public, max-age=60' };
+      const r = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+      if (r.missing) {
+        return Response.json({ note: 'Live demo of /v1/lines/status — the train feed is initializing, check back shortly.', lines: [], attribution: ODPT_ATTR }, { headers: demoHeaders });
+      }
+      const lines = r.data.lines || {};
+      const all = Object.values(lines);
+      const nonNormal = all.filter((l) => l.status !== 'normal').slice(0, 4); // disruptions first
+      const majors = ['odpt.Railway:JR-East.Yamanote', 'odpt.Railway:TokyoMetro.Marunouchi', 'odpt.Railway:JR-East.ChuoRapid', 'odpt.Railway:TokyoMetro.Ginza', 'odpt.Railway:Toei.Oedo'];
+      const pick = [];
+      const add = (l) => { if (l && !pick.some((p) => p.line_id === l.line_id)) pick.push(l); };
+      add(lines['odpt.Railway:JR-East.Yamanote']); // Yamanote always
+      for (const l of nonNormal) add(l);
+      for (const id of majors) { if (pick.length >= 5) break; add(lines[id]); } // fill with majors when calm
+      return Response.json({
+        note: 'Live demo of /v1/lines/status (trimmed to a few lines). This is real data, fetched moments ago. Get a free key at https://api.gachi-tokusuru.com for all 94 lines.',
+        fetched_at: r.fetched_at, stale: r.stale, count: pick.length, lines: pick, attribution: ODPT_ATTR,
+      }, { headers: demoHeaders });
+    }
+    if (request.method === 'GET' && url.pathname === '/example/alerts') {
+      const demoHeaders = { 'access-control-allow-origin': '*', 'cache-control': 'public, max-age=60' };
+      const r = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+      if (r.missing) {
+        return Response.json({ note: 'Live demo of /v1/alerts/active — the alert feed is initializing, check back shortly.', coverage: ALERTS_COVERAGE, alerts: [] }, { headers: demoHeaders });
+      }
+      return Response.json({
+        note: 'Live demo of /v1/alerts/active — river flood forecasts & landslide alerts. count:0 means Japan is calm right now. We return empty honestly.',
+        coverage: ALERTS_COVERAGE, fetched_at: r.fetched_at, stale: r.stale,
+        count: r.data.count ?? (r.data.alerts || []).length, alerts: r.data.alerts || [],
+        source: JMA_ATTR.source, attribution: JMA_ATTR, disclaimer: JMA_DISCLAIMER,
+      }, { headers: demoHeaders });
     }
 
     // Legacy /pro-activate → /activate (keep old payment-completion URLs working, preserve query)
@@ -1052,6 +1306,72 @@ paths:
         "429": { description: Monthly quota reached (Retry-After header) }
         "502": { description: Upstream hazard source lookup failed }
         "503": { description: Hazard source not configured }
+  /v1/alerts/active:
+    get:
+      summary: Active JMA river flood forecasts & landslide alerts (live relay)
+      description: >
+        Relays currently-active JMA 指定河川洪水予報 (river flood forecast, levels 2-5) and
+        土砂災害警戒情報 (landslide warning) as published — level, area, official summary, issue
+        time; a coverage array states exactly what is included. NOT general weather warnings
+        (storm/heavy rain/snow) and NOT earthquakes. Relay of official facts, NOT a warning
+        issued by this service; not a life-safety system. Carries fetched_at and stale; 503 if
+        the feed is uninitialised.
+      responses:
+        "200": { description: "Active alerts (empty array in calm periods)" }
+        "401": { description: Missing/invalid API key }
+        "429": { description: Monthly quota reached }
+        "503": { description: Alert feed not initialized }
+  /v1/alerts/area/{area_code}:
+    get:
+      summary: Active JMA alerts for an area
+      parameters:
+        - { name: area_code, in: path, required: true, schema: { type: string }, description: "2-digit prefecture code (e.g. 13 = Tokyo) or a JMA forecast-area code." }
+      responses:
+        "200": { description: Alerts matching the area }
+        "401": { description: Missing/invalid API key }
+        "503": { description: Alert feed not initialized }
+  /v1/stations/{id}/alerts:
+    get:
+      summary: Active JMA alerts affecting a station's prefecture
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "Station master station_id (e.g. st_00001)." }
+      responses:
+        "200": { description: "Alerts for the station's prefecture (prefecture-level match)" }
+        "401": { description: Missing/invalid API key }
+        "404": { description: Unknown station_id }
+        "503": { description: Alert feed not initialized }
+  /v1/lines/status:
+    get:
+      summary: Live train service status for all Tokyo-area lines (ODPT relay)
+      description: >
+        Live per-line service status relayed from ODPT odpt:TrainInformation. status is an
+        English enum (normal / delayed / suspended / resumed); cause is the operator's original
+        text, with summary_en for known patterns (else null). fetched_at + source_published_at;
+        stale flagged, 503 if uninitialised. Data: CC BY 4.0 (ODPT).
+      responses:
+        "200": { description: All lines with current status }
+        "401": { description: Missing/invalid API key }
+        "503": { description: Train status feed not initialized }
+  /v1/lines/{line_id}/status:
+    get:
+      summary: Live service status for one line
+      parameters:
+        - { name: line_id, in: path, required: true, schema: { type: string }, description: "ODPT railway id, e.g. odpt.Railway:JR-East.Yamanote (URL-encoded)." }
+      responses:
+        "200": { description: The line's current status }
+        "401": { description: Missing/invalid API key }
+        "404": { description: Unknown line_id }
+        "503": { description: Train status feed not initialized }
+  /v1/stations/{id}/lines/status:
+    get:
+      summary: Live status of every line serving a station
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "Station master station_id (e.g. st_00001)." }
+      responses:
+        "200": { description: Status for each line at the station }
+        "401": { description: Missing/invalid API key }
+        "404": { description: Unknown station_id or no lines mapped }
+        "503": { description: Train status feed not initialized }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -1088,6 +1408,57 @@ government/municipal hazard maps at <a href="https://disaportal.gsi.go.jp/">disa
 防災・避難の判断には必ず自治体の公式ハザードマップをご確認ください。</p>
 <p>Errors are JSON: <code>{"error":"&lt;code&gt;","message":"...","docs":"https://api.gachi-tokusuru.com/docs"}</code>.
 Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded (with <code>Retry-After</code>).</p>
+
+<h2 id="realtime">Realtime Layer <span style="font-weight:400;font-size:14px;color:#666">(the one thing you can't cache)</span></h2>
+<p>Live relays from official feeds — <b>JMA River Flood Forecasts &amp; Landslide Alerts</b> and <b>ODPT</b> train
+service status. Open to all plans (throttled by request volume, not feature-gated). Every response carries
+<code>fetched_at</code> (and <code>source_published_at</code> for trains); when the upstream feed is stale the
+response is flagged <code>"stale": true</code>, and when it is unavailable you get a <code>503</code> — we never
+hand you old data with a fresh face.</p>
+<p><b>Alert coverage: nationwide.</b> Station-matching: Greater Tokyo (423 stations) — elsewhere, query by area code.</p>
+<p><b>What the alert feed covers</b> (also returned as <code>coverage</code> in every alert response):</p>
+<ul>
+<li><code>river_flood_forecast (JMA levels 2-5)</code> — 指定河川洪水予報 (氾濫注意 → 氾濫発生)</li>
+<li><code>landslide_warning</code> — 土砂災害警戒情報</li>
+</ul>
+<p><b>What it does NOT cover:</b> general weather warnings (storm / heavy rain / snow 警報・注意報) and earthquakes
+are <b>not</b> in this feed. General weather warnings are on the roadmap; see the FAQ below for earthquakes.</p>
+<p><b>Typhoon-day question an agent can answer in two calls</b> — "It's storming. Are there flood alerts near Shinjuku, and is the Yamanote Line still running?"</p>
+<pre># 1) Any active JMA alerts affecting Shinjuku's prefecture?
+curl "https://api.gachi-tokusuru.com/v1/stations/st_00167/alerts" \\
+  -H "Authorization: Bearer YOUR_API_KEY"
+# 2) Is the Yamanote Line running right now?
+curl "https://api.gachi-tokusuru.com/v1/lines/status" \\
+  -H "Authorization: Bearer YOUR_API_KEY"
+# → each line: { "status": "normal|delayed|suspended|resumed", "cause": "…", "summary_en": "…"|null,
+#               "source_published_at": "…", "line_en": "Yamanote Line" }</pre>
+<p>MCP equivalents: <code>get_active_alerts(area?)</code>, <code>get_station_alerts(station_name)</code>,
+<code>get_train_status(line_or_station)</code> — e.g. ask <i>"is the Yamanote Line running?"</i> in English or Japanese.</p>
+<p><b>See it live (no key):</b> <a href="/example/train-status">/example/train-status</a> · <a href="/example/alerts">/example/alerts</a> — trimmed real data, fetched moments ago.</p>
+<p><b>An actual delayed response</b> — from July 5, 2026, the Fukutoshin Line was delayed while we were building this page (real values, unedited):</p>
+<!-- PROVENANCE: values below are transcribed verbatim from a live read of the
+     train:status:_all KV snapshot on 2026-07-05T11:33:01Z (Fukutoshin Line delayed,
+     summary_en "passenger medical emergency", source_published_at 2026-07-05T20:32:00+09:00).
+     Measured, not fabricated. If the measurement ever differs, fix the values AND the caption. -->
+<pre>GET /v1/lines/odpt.Railway:TokyoMetro.Fukutoshin/status
+{
+  "line_en": "Fukutoshin Line",
+  "line_ja": "副都心線",
+  "status": "delayed",
+  "summary_en": "passenger medical emergency",
+  "source_published_at": "2026-07-05T20:32:00+09:00",
+  "fetched_at": "2026-07-05T11:33:01Z"
+}</pre>
+<p><b>Alerts — an empty array is a feature.</b> When Japan is calm, <code>/v1/alerts/active</code> returns
+<code>count:0</code> with an empty list (plus <code>coverage</code> + disclaimer). We don't pad quiet days.</p>
+<p><b>⚠️ Disclaimer (JMA):</b> alerts are relayed from the Japan Meteorological Agency <b>as published — not warnings
+issued by this service</b>. For evacuation decisions always follow official municipal guidance. Best-effort relay,
+not a life-safety system. Our JMA pipeline also powers a public alert feed on
+<a href="https://x.com/gachi_tokusuru">X (@gachi_tokusuru)</a> — proof the relay is alive.</p>
+<p><b>FAQ — where are earthquakes?</b> Earthquake information is a point-in-time event, not an ongoing
+"active" state, so it is intentionally not listed in the alerts feed. Use the official JMA earthquake
+information for that.</p>
+
 <h2 id="data-stories">Data Stories</h2>
 <p>Two worked examples. Every number below is a real API response or a row from the open datasets — nothing is invented, and there's no interpretation on top.</p>
 
@@ -1147,10 +1518,15 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 > Free tier; MCP + REST share one key.
 
 ## API access
-- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city, get_station_hazard)
+- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city, get_station_hazard, get_active_alerts, get_station_alerts, get_train_status)
 - REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
+- Realtime Layer (live) — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts & landslide warnings, station-matched. Alert coverage: nationwide. Station-matching: Greater Tokyo (423 stations) — elsewhere, query by area code.
+  - REST GET /v1/alerts/active · /v1/alerts/area/{code} · /v1/stations/{station_id}/alerts  (JMA river flood forecasts (levels 2-5) & landslide alerts ONLY — not general weather warnings, not earthquakes; each response has a coverage array; relay of official facts, not a warning we issue)
+  - REST GET /v1/lines/status · /v1/lines/{line_id}/status · /v1/stations/{station_id}/lines/status  (ODPT train service status; enum normal/delayed/suspended/resumed)
+  - Every realtime response carries fetched_at (+ source_published_at for trains); stale data is flagged stale:true or 503, never returned silently.
+- Our JMA pipeline also powers a public alert feed on X (@gachi_tokusuru) — proof the relay is alive.
 - Auth: Authorization: Bearer <key>. Free keys: https://api.gachi-tokusuru.com
 - OpenAPI: https://api.gachi-tokusuru.com/openapi.yaml
 - Example analyses (Data Stories): https://api.gachi-tokusuru.com/docs#data-stories
@@ -1215,6 +1591,8 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </div>
 
 <p><a href="/example" target="_blank" rel="noopener"><b>▶ See a live sample response</b></a> — no key needed, real JSON.</p>
+<p><a href="/example/train-status" target="_blank" rel="noopener"><b>▶ Train status right now</b></a> — live JSON, no key needed.</p>
+<p><a href="/example/alerts" target="_blank" rel="noopener"><b>▶ Active flood &amp; landslide alerts right now</b></a> — usually zero, and that's honest.</p>
 
 <h2>What's inside</h2>
 <ul>
@@ -1224,6 +1602,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <!-- Station Hazard is a LIVE API relay (REST GET /v1/stations/{id}/hazard + MCP get_station_hazard):
      house policy is to relay official MLIT hazard values as-is — no derived scores, no raw redistribution. -->
 <li><b>Station Hazard API (live)</b> — official flood, liquefaction &amp; storm-surge categories from MLIT for <b>423 stations</b>, relayed live per station (REST + MCP); landslide &amp; tsunami link out to the official maps (license-restricted)</li>
+<li><b>Realtime Layer (live)</b> — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts &amp; landslide warnings, station-matched. <b>The one thing you can't cache.</b></li>
 <li><b>More APIs launching on this data</b> — All Access subscribers get every new one automatically</li>
 </ul>
 
@@ -1250,6 +1629,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <li><b>Nationwide station coverage</b> — expanding the station master beyond Greater Tokyo (hazard &amp; ridership grow with it)</li>
 <li><b>Akiya Intelligence</b> — municipality vacancy statistics (1998–2023) + a one-call context API: vacancy × ridership decline × hazard</li>
 <li><b>Seismic risk</b> — earthquake shaking categories per station</li>
+<li><b>General weather warnings</b> (storm, heavy rain, snow) — planned</li>
 </ul>
 <p class="mut">No dates promised — we ship when it's right. All Access &amp; Business subscribers get every new API automatically.</p>
 
