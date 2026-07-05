@@ -35,13 +35,13 @@ Station names accept Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for majo
 |------|----------|---------|
 | `get_toilet_by_station` | `station` (Japanese or romaji) | Accessible toilets in a Tokyo station, with `nearest_exit` |
 | `get_public_toilet_by_city` | `city` (Japanese) | Public toilets in a municipality (top 50 for large cities) |
-| `get_station_hazard` | `station_name` (Japanese or romaji) | Official MLIT hazard categories at a station (flood/liquefaction/landslide/storm-surge/tsunami), relayed live — no derived score. Not a substitute for official hazard maps. |
+| `get_station_hazard` | `station_name` (Japanese or romaji) | Official MLIT hazard categories at a station (flood / liquefaction / storm-surge), relayed live, cached 14 days — no derived score. Landslide & tsunami are license-restricted (`available:false` + link to official maps). Not a substitute for official hazard maps. |
 
 ## REST endpoints
 
 - `GET /v1/station-toilets/search?station=Shinjuku` — accessible toilets in a Tokyo station
 - `GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=` — public toilets near a point
-- `GET /v1/stations/{station_id}/hazard` — **official MLIT hazard categories at a station, relayed live** (flood inundation-depth rank, liquefaction/landform, landslide/storm-surge/tsunami presence). Values are returned verbatim from 国土交通省 不動産情報ライブラリ with attribution — **no derived score**, and **not a substitute for official hazard maps**. Also available as the MCP tool `get_station_hazard(station_name)`. `station_id` comes from the [Japan Station Master](https://github.com/eng213035/gachi-open-datasets) (e.g. `st_00001`); 423 of 425 stations have coordinates (2 remain unlocated → `hazard: null`).
+- `GET /v1/stations/{station_id}/hazard` — **official MLIT hazard categories at a station, relayed live** (flood inundation-depth rank, liquefaction/landform, storm-surge presence). Values are returned verbatim from 国土交通省 不動産情報ライブラリ with attribution, cached 14 days — **no derived score**, and **not a substitute for official hazard maps**. Landslide & tsunami source layers are 一部非商用 (license-restricted), so they return `available:false` with a link to the official hazard maps. Also available as the MCP tool `get_station_hazard(station_name)`. `station_id` comes from the [Japan Station Master](https://github.com/eng213035/gachi-open-datasets) (e.g. `st_00001`); 423 of 425 stations have coordinates (2 remain unlocated → `hazard: null`).
 
 All endpoints use the same `Authorization: Bearer <key>` and share one monthly quota. Full spec: `/openapi.yaml`, docs: `/docs`.
 

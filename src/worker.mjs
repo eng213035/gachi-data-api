@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: '6f171f9',
-  built: '2026-07-05T04:58:00Z',
-  build: 'hazard-launch-mcp-tool',
+  commit: '306fb71',
+  built: '2026-07-05T05:15:00Z',
+  build: 'hazard-cache-license-filter',
   pricing_tiers: 4,
 };
 
@@ -89,7 +89,8 @@ const TOOLS = [
     description:
       'Official disaster-risk categories at a Japanese train station, relayed live from the MLIT ' +
       '不動産情報ライブラリ (Real Estate Information Library): flood inundation-depth rank, landform / ' +
-      'liquefaction classification, and landslide / storm-surge / tsunami inundation-area presence. ' +
+      'liquefaction classification, and storm-surge inundation-area presence (landslide & tsunami are ' +
+      'license-restricted and return available:false with a link to the official maps). ' +
       'Returns the official values/categories as-is — no composite score, no judgment. Accepts a station ' +
       'name in Japanese (新宿, 武蔵小杉) or romaji (Shinjuku, Musashi-Kosugi). For research/analytics; ' +
       'NOT a substitute for official government hazard maps or evacuation decisions.',
@@ -369,59 +370,88 @@ async function reinfoLayer(env, code, x, y) {
   if (!res.ok) throw new Error(`reinfolib ${code} HTTP ${res.status}`);
   return res.json();
 }
-async function stationHazard(env, coords) {
-  const pt = [coords.lng, coords.lat];
-  const { x, y } = hazTile(coords.lat, coords.lng, 14);
-  const [flood, liq, landslide, surge, tsunami] = await Promise.all([
-    reinfoLayer(env, 'XKT026', x, y).catch(() => null),
-    reinfoLayer(env, 'XKT025', x, y).catch(() => null),
-    reinfoLayer(env, 'XKT011', x, y).catch(() => null),
-    reinfoLayer(env, 'XKT027', x, y).catch(() => null),
-    reinfoLayer(env, 'XKT028', x, y).catch(() => null),
-  ]);
+const LAYER_META = {
+  flood: '国土交通省 不動産情報ライブラリ XKT026 (洪水浸水想定区域・想定最大規模)',
+  liquefaction: '国土交通省 不動産情報ライブラリ XKT025 (地形分類による液状化傾向図)',
+  storm_surge: '国土交通省 不動産情報ライブラリ XKT027 (高潮浸水想定区域)',
+};
+const OFFICIAL_HAZARD_MAP = 'https://disaportal.gsi.go.jp/';
 
-  // Flood: keep only inundation polygons that actually contain the station point (point precision,
-  // not tile-max), then report the deepest official rank + the rivers those polygons belong to.
-  const floodHits = (flood?.features || []).filter((f) => polyContains(pt, f.geometry));
-  const floodRank = floodHits.length ? Math.max(0, ...floodHits.map((f) => Number(f.properties?.A31a_205) || 0)) : 0;
-  const rivers = [...new Set(floodHits.map((f) => f.properties?.A31a_202).filter(Boolean))];
-
-  // Liquefaction/landform: the landform polygon containing the point (official classification + note).
-  const liqHit = (liq?.features || []).find((f) => polyContains(pt, f.geometry));
-
-  const present = (d) => !!(d && (d.features || []).length > 0);
-
+// --- per-layer parsers (official values only) ---
+function parseFlood(data, pt) {
+  // Keep only inundation polygons that contain the station point (point precision, not tile-max);
+  // report the deepest official rank + the rivers those polygons belong to.
+  const hits = (data.features || []).filter((f) => polyContains(pt, f.geometry));
+  const rank = hits.length ? Math.max(0, ...hits.map((f) => Number(f.properties?.A31a_205) || 0)) : 0;
+  const rivers = [...new Set(hits.map((f) => f.properties?.A31a_202).filter(Boolean))];
   return {
-    flood: {
-      inundation_expected: floodRank > 0,
-      depth_rank: floodRank || null,
-      depth_category: floodRank ? FLOOD_RANK_EN[floodRank] : 'none',
-      depth_category_ja: floodRank ? FLOOD_RANK_JA[floodRank] : 'なし',
-      rivers: rivers.length ? rivers : null,
-      source: '国土交通省 不動産情報ライブラリ XKT026 (洪水浸水想定区域・想定最大規模)',
-    },
-    liquefaction: liqHit
-      ? {
-          landform_ja: liqHit.properties?.topographic_classification_name_ja ?? null,
-          tendency_level: Number(liqHit.properties?.liquefaction_tendency_level) || null,
-          tendency_note_ja: liqHit.properties?.note ?? null,
-          source: '国土交通省 不動産情報ライブラリ XKT025 (地形分類による液状化傾向図)',
-        }
-      : { landform_ja: null, tendency_level: null, tendency_note_ja: null, note: 'no data at this point', source: '国土交通省 不動産情報ライブラリ XKT025 (地形分類による液状化傾向図)' },
-    landslide: {
-      warning_area_present: present(landslide),
-      source: '国土交通省 不動産情報ライブラリ XKT011 (土砂災害警戒区域)',
-      commercial_use: 'restricted_in_some_prefectures — verify the source terms before commercial redistribution',
-    },
-    storm_surge: {
-      inundation_area_present: present(surge),
-      source: '国土交通省 不動産情報ライブラリ XKT027 (高潮浸水想定区域)',
-    },
-    tsunami: {
-      inundation_area_present: present(tsunami),
-      source: '国土交通省 不動産情報ライブラリ XKT028 (津波浸水想定)',
-      commercial_use: 'restricted_in_some_prefectures — verify the source terms before commercial redistribution',
-    },
+    inundation_expected: rank > 0,
+    depth_rank: rank || null,
+    depth_category: rank ? FLOOD_RANK_EN[rank] : 'none',
+    depth_category_ja: rank ? FLOOD_RANK_JA[rank] : 'なし',
+    rivers: rivers.length ? rivers : null,
+    source: LAYER_META.flood,
+  };
+}
+function parseLiquefaction(data, pt) {
+  const hit = (data.features || []).find((f) => polyContains(pt, f.geometry));
+  if (!hit) return { landform_ja: null, tendency_level: null, tendency_note_ja: null, note: 'no data at this point', source: LAYER_META.liquefaction };
+  return {
+    landform_ja: hit.properties?.topographic_classification_name_ja ?? null,
+    tendency_level: Number(hit.properties?.liquefaction_tendency_level) || null,
+    tendency_note_ja: hit.properties?.note ?? null,
+    source: LAYER_META.liquefaction,
+  };
+}
+function parseStormSurge(data) {
+  return { inundation_area_present: (data.features || []).length > 0, source: LAYER_META.storm_surge };
+}
+
+// Per-layer KV cache: key `hazard:<station_id>:<type>`, 14-day TTL. Only successful upstream
+// lookups are cached. attribution + disclaimer are re-attached at serve time (hazardFromRec),
+// never stored in the cache, so they are always present — even on a cache hit.
+const HAZARD_CACHE_TTL = 14 * 24 * 3600; // 14 days (seconds)
+async function cachedLayer(env, sid, type, fetchParse) {
+  const key = sid ? `hazard:${sid}:${type}` : null;
+  if (key) {
+    const cached = await env.TOILET_KV.get(key, 'json').catch(() => null);
+    if (cached) return { ...cached, cached: true };
+  }
+  const val = await fetchParse(); // throws on upstream failure -> not cached
+  if (key) await env.TOILET_KV.put(key, JSON.stringify(val), { expirationTtl: HAZARD_CACHE_TTL }).catch(() => {});
+  return val;
+}
+
+// Landslide (XKT011) & tsunami (XKT028) source layers are 一部非商用 (commercial use restricted in
+// some prefectures), so they are EXCLUDED from this paid API. Return a pointer to the official maps
+// instead of the source value. Rationale: docs/hazard-license-check.md.
+function excludedLayer(sourceLabel) {
+  return {
+    available: false,
+    reason: 'Excluded from this API: the source layer is 一部非商用 (commercial use restricted in some prefectures), so it is not served through this paid endpoint.',
+    official_map: OFFICIAL_HAZARD_MAP,
+    source: sourceLabel,
+  };
+}
+
+async function stationHazard(env, rec) {
+  const sid = rec.id ?? null;
+  const pt = [rec.lng, rec.lat];
+  const { x, y } = hazTile(rec.lat, rec.lng, 14);
+  // Only commercial-OK layers are fetched (flood / liquefaction / storm surge), each cached per
+  // station+type. A per-layer upstream failure degrades to `unavailable` and is NOT cached.
+  const guard = (type, fn) => cachedLayer(env, sid, type, fn).catch(() => ({ unavailable: true, note: 'hazard source lookup failed; try again later', source: LAYER_META[type] }));
+  const [flood, liquefaction, storm_surge] = await Promise.all([
+    guard('flood', async () => parseFlood(await reinfoLayer(env, 'XKT026', x, y), pt)),
+    guard('liquefaction', async () => parseLiquefaction(await reinfoLayer(env, 'XKT025', x, y), pt)),
+    guard('storm_surge', async () => parseStormSurge(await reinfoLayer(env, 'XKT027', x, y))),
+  ]);
+  return {
+    flood,
+    liquefaction,
+    storm_surge,
+    landslide: excludedLayer('国土交通省 不動産情報ライブラリ XKT011 (土砂災害警戒区域)'),
+    tsunami: excludedLayer('国土交通省 不動産情報ライブラリ XKT028 (津波浸水想定)'),
   };
 }
 
@@ -432,7 +462,7 @@ async function hazardFromRec(env, rec) {
   if (typeof rec.lat !== 'number' || typeof rec.lng !== 'number') {
     return { station, hazard: null, note: 'This station has no coordinates in the Japan Station Master, so a point hazard lookup is not available.', attribution: HAZARD_ATTRIBUTION };
   }
-  const hazard = await stationHazard(env, { lat: rec.lat, lng: rec.lng });
+  const hazard = await stationHazard(env, rec);
   return { station: { ...station, lat: rec.lat, lng: rec.lng, pref: rec.pref || null }, hazard, disclaimer: HAZARD_DISCLAIMER, attribution: HAZARD_ATTRIBUTION };
 }
 // Resolve a station by name for the MCP tool: exact Japanese (name_ja) then normalized romaji.
@@ -958,9 +988,11 @@ paths:
       description: >
         Returns the official MLIT 不動産情報ライブラリ hazard values/categories at the
         station's location — flood inundation depth rank, liquefaction/landform, and
-        landslide / storm-surge / tsunami inundation-area presence — relayed verbatim
-        (no derived score). station_id comes from the Japan Station Master (e.g. st_00001);
-        327 of 425 stations have coordinates. NOT a substitute for official hazard maps.
+        storm-surge inundation-area presence — relayed verbatim (no derived score) and
+        cached 14 days. Landslide & tsunami are license-restricted (一部非商用) and return
+        available:false with a link to the official hazard maps. station_id comes from the
+        Japan Station Master (e.g. st_00001); 423 of 425 stations have coordinates.
+        NOT a substitute for official hazard maps.
       parameters:
         - name: id
           in: path
@@ -996,9 +1028,10 @@ Auth header on every call: <code>Authorization: Bearer &lt;key&gt;</code>. MCP a
 <pre>curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&radius=800&wheelchair=true" \\
   -H "Authorization: Bearer YOUR_API_KEY"</pre>
 <h2>Official hazard info at a station <span style="font-weight:400;font-size:14px;color:#666">(live relay to MLIT 不動産情報ライブラリ)</span></h2>
-<p>Official flood / liquefaction / landslide / storm-surge / tsunami categories at a station's
-location, relayed as-is (no derived score). <code>id</code> is a Japan Station Master
-<code>station_id</code> (e.g. <code>st_00001</code>).</p>
+<p>Official flood / liquefaction / storm-surge categories at a station's location, relayed as-is
+(no derived score) and cached 14 days. Landslide &amp; tsunami are 一部非商用 (license-restricted), so
+they return <code>available:false</code> with a link to the official hazard maps. <code>id</code> is
+a Japan Station Master <code>station_id</code> (e.g. <code>st_00001</code>).</p>
 <pre>curl "https://api.gachi-tokusuru.com/v1/stations/st_00001/hazard" \\
   -H "Authorization: Bearer YOUR_API_KEY"</pre>
 <p>Also available as the MCP tool <code>get_station_hazard(station_name)</code> — pass a station name
@@ -1088,7 +1121,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <li><b>Ridership 2000–2025 (open dataset)</b> — 292 stations, annual series through the COVID collapse and recovery</li>
 <!-- Station Hazard is a LIVE API relay (REST GET /v1/stations/{id}/hazard + MCP get_station_hazard):
      house policy is to relay official MLIT hazard values as-is — no derived scores, no raw redistribution. -->
-<li><b>Station Hazard API (live)</b> — official flood, liquefaction, landslide, storm-surge &amp; tsunami categories from MLIT, relayed live per station (REST + MCP)</li>
+<li><b>Station Hazard API (live)</b> — official flood, liquefaction &amp; storm-surge categories from MLIT, relayed live per station (REST + MCP); landslide &amp; tsunami link out to the official maps (license-restricted)</li>
 <li><b>More APIs launching on this data</b> — All Access subscribers get every new one automatically</li>
 </ul>
 
