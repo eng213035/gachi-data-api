@@ -6,7 +6,7 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'pending',
+  commit: 'c0f7682',
   built: '2026-07-05T04:14:08Z',
   build: 'remove-enterprise-4tier',
   pricing_tiers: 4,
