@@ -21,7 +21,7 @@ Station names accept Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for majo
 ```json
 {
   "mcpServers": {
-    "japan-toilet": {
+    "gachi-data": {
       "url": "https://api.gachi-tokusuru.com/mcp",
       "headers": { "Authorization": "Bearer YOUR_API_KEY" }
     }

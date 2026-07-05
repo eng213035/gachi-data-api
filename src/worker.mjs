@@ -6,10 +6,10 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'v2-nationwide-vacancy-context',
-  built: '2026-07-05T15:10:41Z',
-  build: 'v2-nationwide-9145-vacancy-context-api',
-  pricing_tiers: 4,
+  commit: 'lp-v5-final-polish',
+  built: '2026-07-05T16:00:00Z',
+  build: 'lp-v5-enterprise-priorart-attribution',
+  pricing_tiers: 5,
 };
 
 const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
@@ -723,7 +723,7 @@ async function handleRpc(body, env) {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: {
-        name: 'gachi-japan-toilet-mcp',
+        name: 'gachi-data-api',
         version: '0.3.0',
         description: "Deep, obscure Japanese data you won't find anywhere else — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents.",
       },
@@ -1362,7 +1362,7 @@ export default {
         + '<p>First call:</p>'
         + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\\n  -H "Authorization: Bearer ${r.key}"</pre>`
         + '<p>MCP client config:</p>'
-        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">{"mcpServers":{"japan-toilet":{"url":"https://api.gachi-tokusuru.com/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}</pre>`
+        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">{"mcpServers":{"gachi-data":{"url":"https://api.gachi-tokusuru.com/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}</pre>`
         + '<p class="mut">Full API docs: <a href="/docs">/docs</a>. This key works for both MCP and REST (shared monthly quota).</p>'
         + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. Questions? contact@gachi-tokusuru.com</p>`,
       ), { headers: htmlHeaders });
@@ -1657,7 +1657,7 @@ service status. Open to all plans (throttled by request volume, not feature-gate
 <code>fetched_at</code> (and <code>source_published_at</code> for trains); when the upstream feed is stale the
 response is flagged <code>"stale": true</code>, and when it is unavailable you get a <code>503</code> — we never
 hand you old data with a fresh face.</p>
-<p><b>Alert coverage: nationwide.</b> Station-matching: Greater Tokyo (423 stations) — elsewhere, query by area code.</p>
+<p><b>Alert coverage: nationwide.</b> Station-matching is prefecture-level and works nationwide (any station's <code>pref</code>) — or query directly by prefecture / JMA area code.</p>
 <p><b>What the alert feed covers</b> (also returned as <code>coverage</code> in every alert response):</p>
 <ul>
 <li><code>river_flood_forecast (JMA levels 2-5)</code> — 指定河川洪水予報 (氾濫注意 → 氾濫発生)</li>
@@ -1750,6 +1750,23 @@ year    passenger_journeys
      vacancy × ridership × hazard × population, and update this Data Story's example accordingly. -->
 <p>Ridership from the open dataset, hazard from the API — joined on one <code>station_id</code>. The Context API will fold vacancy × ridership × hazard × population into a single call: next on the roadmap.</p>
 
+<h2 id="prior-art">Prior art &amp; why we're different</h2>
+<p>We're not the first to open up Japanese railway and station data, and we stand on the shoulders of the people who tried before us. A few we learned from and respect:</p>
+<ul>
+<li><a href="https://github.com/adieuadieu/japan-train-data" target="_blank" rel="noopener">adieuadieu/japan-train-data</a> — a circular object of Japanese train data with station geocoding and <b>machine translations</b>. Great for a map; the auto-translated English names are exactly the kind of quality gap we set out to close with per-name provenance.</li>
+<li><a href="https://github.com/piuccio/open-data-jp-railway-stations" target="_blank" rel="noopener">piuccio/open-data-jp-railway-stations</a> — a clean list built from ekidata with <b>manually generated</b> codes to bridge naming conventions. Careful work, but hand-maintained crosswalks are hard to keep current across 6 operators and 20 years of mergers.</li>
+<li><a href="https://github.com/IvanReyesO7/tokyo-stations-API" target="_blank" rel="noopener">IvanReyesO7/tokyo-stations-API</a> — a focused API for stations inside Tokyo prefecture. A solid Tokyo slice; nationwide, cross-operator entity resolution is the part that doesn't scale by hand.</li>
+</ul>
+<p>Most of these have seen little maintenance since around 2017. That's not a knock — keeping this data current is genuinely hard, which is the whole reason this exists.</p>
+<p><b>Don't take our word for it — check yourself:</b></p>
+<ul>
+<li><code>station_members.csv</code> — see Shinjuku collapse from 13 raw operator records into 1 resolved <code>station_id</code>.</li>
+<li><code>low_confidence_review.csv</code> — the 51 candidate pairs we <b>did not</b> auto-merge, kept out for human review rather than guessed.</li>
+<li><code>name_source</code> flag — every English name is tagged <code>odpt</code> / <code>wikidata</code> / <code>romanized</code>; ~7% are romanized, and we disclose it rather than hide it.</li>
+<li><code>CHANGELOG</code> — every dataset revision, dated.</li>
+</ul>
+<p>All of the above live in the open dataset repo: <a href="https://github.com/eng213035/gachi-open-datasets" target="_blank" rel="noopener">github.com/eng213035/gachi-open-datasets</a>.</p>
+
 <p><a href="/">← Back to home &amp; pricing</a></p>
 </body></html>`;
 
@@ -1765,7 +1782,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
 - REST GET /v1/municipalities/{code}/context · /v1/stations/{station_id}/context  (Municipality Context API: vacancy 2003-2023 × nearest-station ridership × hazard × land price × livability, one call per municipality or station; official values only, no scores; Free 1 municipality/day)
-- Realtime Layer (live) — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts & landslide warnings, station-matched. Alert coverage: nationwide. Station-matching: Greater Tokyo (423 stations) — elsewhere, query by area code.
+- Realtime Layer (live) — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts & landslide warnings, station-matched. Alert coverage: nationwide. Station-matching: prefecture-level, nationwide (any station's pref) — or query by prefecture / JMA area code.
   - REST GET /v1/alerts/active · /v1/alerts/area/{code} · /v1/stations/{station_id}/alerts  (JMA river flood forecasts (levels 2-5) & landslide alerts ONLY — not general weather warnings, not earthquakes; each response has a coverage array; relay of official facts, not a warning we issue)
   - REST GET /v1/lines/status · /v1/lines/{line_id}/status · /v1/stations/{station_id}/lines/status  (ODPT train service status; enum normal/delayed/suspended/resumed)
   - Every realtime response carries fetched_at (+ source_published_at for trains); stale data is flagged stale:true or 503, never returned silently.
@@ -1849,6 +1866,18 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <li><b>Station Hazard API (live)</b> — official flood, liquefaction &amp; storm-surge categories from MLIT for <b>9,143 stations</b>, relayed live per station (REST + MCP); landslide &amp; tsunami link out to the official maps (license-restricted)</li>
 <li><b>Realtime Layer (live)</b> — service status for 94 Tokyo-area train lines (delays, suspensions, resumptions) + nationwide JMA river flood forecasts &amp; landslide warnings, station-matched. <b>The one thing you can't cache.</b></li>
 </ul>
+<p class="mut">Coverage varies by design: station master, hazard &amp; alerts are nationwide; accessibility is Tokyo-first (where ~70% of visitors go); ridership expands nationwide next (MLIT source already verified).</p>
+
+<h2>What can you build?</h2>
+<ul>
+<li>A travel agent that answers "wheelchair route + nearest accessible toilet + is my line running?" — one key, three calls</li>
+<li>An akiya-listing site that shows, per property town: vacancy trend, station ridership decline, flood category — official sources, cited</li>
+<li>A research notebook on 20 years of urban shrinkage, from citable datasets (DOI) — no scraping, no cleaning</li>
+</ul>
+<p><b>Interpretation is your agent's job. Guaranteed official facts are ours.</b></p>
+
+<h2>Why this exists</h2>
+<p>Why does this exist? The raw data is free — and fragmented across 6 operators' IDs, 47 prefectures' formats, and 20 years of municipal mergers. We did the weeks of entity resolution so your agent doesn't have to. Previous attempts: abandoned since 2017 — <a href="/docs#prior-art">see the evidence →</a></p>
 
 <h2>Built with this data</h2>
 <p class="mut">Three live products, one data pipeline — we eat our own cooking.</p>
@@ -1900,7 +1929,13 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
   <td><i>For teams and companies</i><br>Team key sharing (multiple seats) · embed in your company's products &amp; internal systems (no redistribution of raw data) · all current + upcoming APIs included<br>
   ${payCta('business', "your API key is issued instantly after checkout.")}</td>
 </tr>
+<tr>
+  <td class="price">Enterprise</td><td>from $2,500/yr</td><td>Bulk exports</td>
+  <td><i>Bulk data &amp; redistribution rights</i><br>Full dataset exports (Parquet/CSV): station master, ridership, accessibility, hazard <span class="mut">(in preparation)</span> · commercial redistribution license · annual data updates included · invoice billing · best-effort email support<br>
+  <a href="#bizform-anchor"><button type="button">Contact us</button></a></td>
+</tr>
 </table>
+<p class="mut">Fair use = we contact you before throttling, never silently. Hard caps are the numbers you see — no hidden limits.</p>
 <p class="mut">Free, Pro and All Access are licensed to a single individual developer — commercial projects welcome. Teams and companies, please use Business or above.</p>
 <p class="mut">Already subscribed? <a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription</a> anytime.</p>
 
@@ -1915,7 +1950,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <h2>Connect from an MCP client (Claude Desktop / Claude Code)</h2>
 <pre>{
   "mcpServers": {
-    "japan-toilet": {
+    "gachi-data": {
       "url": "https://api.gachi-tokusuru.com/mcp",
       "headers": { "Authorization": "Bearer YOUR_API_KEY" }
     }
@@ -1940,7 +1975,7 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
 <b>station master (9,145 stations, cross-operator, entity-resolved), ridership 2000–2025, and housing vacancy 2003–2023 (1,653 municipalities, with merger crosswalk)</b>.</p>
 <ul>
 <li><a href="${DATASETS.github}" target="_blank" rel="noopener">GitHub</a> — source + build pipeline</li>
-<li><a href="${DATASETS.zenodo_url}" target="_blank" rel="noopener">Zenodo</a> — DOI <code>${DATASETS.zenodo_doi}</code> (citable archive)</li>
+<li><a href="${DATASETS.zenodo_url}" target="_blank" rel="noopener">Zenodo</a> — DOI <code>${DATASETS.zenodo_doi}</code> (citable archive: station master + ridership 2000–2025 + municipality housing vacancy 2003–2023)</li>
 <li><a href="${DATASETS.kaggle}" target="_blank" rel="noopener">Kaggle</a> — notebooks &amp; discovery</li>
 </ul>
 <p class="mut">The newest survey year reaches API subscribers first; it lands in the free dataset at the next annual release.</p>
@@ -1957,7 +1992,16 @@ curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&
 
 <footer>
 <p><b><a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription →</a></b> (Pro subscribers) &nbsp;·&nbsp; contact@gachi-tokusuru.com</p>
-<p>Data: Tokyo Metropolitan Government &amp; BODIK municipal open data (CC BY 4.0). <code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.</p>
+<p><b>Sources &amp; attribution</b> (all official / open data, redistributed under their terms):</p>
+<ul class="mut" style="font-size:13px">
+<li>Tokyo Metropolitan Government (Bureau of Social Welfare) &amp; BODIK — accessible &amp; public toilets (CC BY 4.0)</li>
+<li>ODPT (Public Transportation Open Data Center) — station names &amp; train information</li>
+<li>MLIT 不動産情報ライブラリ (Real Estate Information Library) — hazard categories, population, land price</li>
+<li>JMA (Japan Meteorological Agency) — flood forecasts &amp; landslide alerts</li>
+<li>Statistics Bureau of Japan (住宅・土地統計調査) &amp; MIC (総務省) — housing vacancy &amp; municipality codes</li>
+<li>MLIT 国土数値情報 N02/P11 — nationwide stations &amp; bus stops; English names partly via Wikidata (CC0)</li>
+</ul>
+<p><code>nearest_exit</code> is an original derived value by gachi-tokusuru.com. Timeliness, accuracy and completeness are not guaranteed.</p>
 </footer>
 
 <script>
