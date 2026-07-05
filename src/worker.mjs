@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'fb7aa8c',
-  built: '2026-07-05T04:37:35Z',
-  build: 'hazard-relay-endpoint',
+  commit: '6f171f9',
+  built: '2026-07-05T04:58:00Z',
+  build: 'hazard-launch-mcp-tool',
   pricing_tiers: 4,
 };
 
@@ -82,6 +82,27 @@ const TOOLS = [
         },
       },
       required: ['city'],
+    },
+  },
+  {
+    name: 'get_station_hazard',
+    description:
+      'Official disaster-risk categories at a Japanese train station, relayed live from the MLIT ' +
+      '不動産情報ライブラリ (Real Estate Information Library): flood inundation-depth rank, landform / ' +
+      'liquefaction classification, and landslide / storm-surge / tsunami inundation-area presence. ' +
+      'Returns the official values/categories as-is — no composite score, no judgment. Accepts a station ' +
+      'name in Japanese (新宿, 武蔵小杉) or romaji (Shinjuku, Musashi-Kosugi). For research/analytics; ' +
+      'NOT a substitute for official government hazard maps or evacuation decisions.',
+    argName: 'station_name',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        station_name: {
+          type: 'string',
+          description: 'Station name in Japanese (新宿, 武蔵小杉) or romaji (Shinjuku, Musashi-Kosugi).',
+        },
+      },
+      required: ['station_name'],
     },
   },
 ];
@@ -404,6 +425,37 @@ async function stationHazard(env, coords) {
   };
 }
 
+// Resolve a station record (with coords) from a station record whose lat/lng may be null,
+// producing the final hazard payload. Shared by REST (by id) and MCP (by name).
+async function hazardFromRec(env, rec) {
+  const station = { id: rec.id ?? null, name: rec.n || null, name_ja: rec.nj || null };
+  if (typeof rec.lat !== 'number' || typeof rec.lng !== 'number') {
+    return { station, hazard: null, note: 'This station has no coordinates in the Japan Station Master, so a point hazard lookup is not available.', attribution: HAZARD_ATTRIBUTION };
+  }
+  const hazard = await stationHazard(env, { lat: rec.lat, lng: rec.lng });
+  return { station: { ...station, lat: rec.lat, lng: rec.lng, pref: rec.pref || null }, hazard, disclaimer: HAZARD_DISCLAIMER, attribution: HAZARD_ATTRIBUTION };
+}
+// Resolve a station by name for the MCP tool: exact Japanese (name_ja) then normalized romaji.
+async function resolveStationByName(env, name) {
+  const raw = (name || '').trim();
+  if (!raw) return null;
+  let rec = await env.TOILET_KV.get(`hzn:${raw}`, 'json');
+  if (rec) return rec;
+  const n = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (n) rec = await env.TOILET_KV.get(`hzn:${n}`, 'json');
+  return rec || null;
+}
+// MCP get_station_hazard: name -> official hazard values (errors returned in-band, MCP-style).
+async function hazardPayload(env, name) {
+  if (!env.REINFOLIB_API_KEY) return { error: 'Hazard source is not configured.', attribution: HAZARD_ATTRIBUTION };
+  const q = (name || '').trim();
+  if (!q) return { error: 'station_name is required.', attribution: HAZARD_ATTRIBUTION };
+  const rec = await resolveStationByName(env, q);
+  if (!rec) return { error: `No station found for "${q}". Try Japanese (新宿) or romaji (Shinjuku, Musashi-Kosugi).`, attribution: HAZARD_ATTRIBUTION };
+  try { return await hazardFromRec(env, rec); }
+  catch (e) { return { error: `Hazard source lookup failed: ${e.message}`, attribution: HAZARD_ATTRIBUTION }; }
+}
+
 function rpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -545,6 +597,11 @@ async function handleRpc(body, env) {
   if (method === 'tools/call') {
     const tool = TOOLS.find((t) => t.name === params?.name);
     if (!tool) return rpcError(id, -32602, `unknown tool: ${params?.name}`);
+    // Hazard tool: name -> coords -> live reinfolib relay (not a KV toilet lookup).
+    if (tool.name === 'get_station_hazard') {
+      const payload = await hazardPayload(env, params?.arguments?.station_name);
+      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    }
     const query = params?.arguments?.[tool.argName];
     const found = query ? await lookup(env, tool.prefix, query) : null;
     let payload;
@@ -639,23 +696,11 @@ export default {
       const stationId = decodeURIComponent(hazMatch[1]);
       const rec = await env.TOILET_KV.get(`sta:${stationId}`, 'json');
       if (!rec) return restError('not_found', `Unknown station_id "${stationId}". IDs come from the Japan Station Master (e.g. st_00001).`, 404);
-      if (typeof rec.lat !== 'number' || typeof rec.lng !== 'number') {
-        return restJson({
-          station: { id: stationId, name: rec.n || null, name_ja: rec.nj || null },
-          hazard: null,
-          note: 'This station has no coordinates in the Japan Station Master, so a point hazard lookup is not available.',
-          attribution: HAZARD_ATTRIBUTION,
-        });
-      }
-      let hazard;
-      try { hazard = await stationHazard(env, { lat: rec.lat, lng: rec.lng }); }
+      rec.id = stationId;
+      let payload;
+      try { payload = await hazardFromRec(env, rec); }
       catch (e) { return restError('upstream_error', `Hazard source lookup failed: ${e.message}`, 502); }
-      return restJson({
-        station: { id: stationId, name: rec.n || null, name_ja: rec.nj || null, lat: rec.lat, lng: rec.lng, pref: rec.pref || null },
-        hazard,
-        disclaimer: HAZARD_DISCLAIMER,
-        attribution: HAZARD_ATTRIBUTION,
-      });
+      return restJson(payload);
     }
 
     if (request.method === 'GET' && url.pathname === '/v1/station-toilets/search') {
@@ -953,9 +998,15 @@ Auth header on every call: <code>Authorization: Bearer &lt;key&gt;</code>. MCP a
 <h2>Official hazard info at a station <span style="font-weight:400;font-size:14px;color:#666">(live relay to MLIT 不動産情報ライブラリ)</span></h2>
 <p>Official flood / liquefaction / landslide / storm-surge / tsunami categories at a station's
 location, relayed as-is (no derived score). <code>id</code> is a Japan Station Master
-<code>station_id</code> (e.g. <code>st_00001</code>). Not a substitute for official hazard maps.</p>
+<code>station_id</code> (e.g. <code>st_00001</code>).</p>
 <pre>curl "https://api.gachi-tokusuru.com/v1/stations/st_00001/hazard" \\
   -H "Authorization: Bearer YOUR_API_KEY"</pre>
+<p>Also available as the MCP tool <code>get_station_hazard(station_name)</code> — pass a station name
+in Japanese (新宿) or romaji (Shinjuku, Musashi-Kosugi).</p>
+<p><b>⚠️ Disclaimer:</b> for research &amp; analytics only. This is NOT a substitute for official hazard
+maps and must NOT be the sole basis for safety or evacuation decisions — always consult the
+government/municipal hazard maps at <a href="https://disaportal.gsi.go.jp/">disaportal.gsi.go.jp</a>.
+防災・避難の判断には必ず自治体の公式ハザードマップをご確認ください。</p>
 <p>Errors are JSON: <code>{"error":"&lt;code&gt;","message":"...","docs":"https://api.gachi-tokusuru.com/docs"}</code>.
 Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded (with <code>Retry-After</code>).</p>
 <p><a href="/">← Back to home &amp; pricing</a></p>
@@ -968,7 +1019,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 > travel and accessibility apps. Free tier; MCP + REST share one key.
 
 ## API access
-- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city)
+- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city, get_station_hazard)
 - REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
@@ -1035,10 +1086,9 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 <li><b>Accessibility API (live)</b> — 526 Tokyo stations with floor, gender, equipment &amp; <code>nearest_exit</code>; 612 municipalities of public toilets nationwide</li>
 <li><b>Station Master (open dataset)</b> — 425 stations, entity-resolved across operators (Shinjuku = 6 companies, 1 ID), English names</li>
 <li><b>Ridership 2000–2025 (open dataset)</b> — 292 stations, annual series through the COVID collapse and recovery</li>
-<!-- Station Hazard is a LIVE API relay (GET /v1/stations/{id}/hazard), not a static dataset:
-     house policy is to relay official MLIT hazard values as-is (no derived scores, no raw
-     redistribution). When announced, change "(launching soon)" → "(live)". -->
-<li><b>Station Hazard API (launching soon)</b> — official flood, liquefaction, landslide, storm-surge &amp; tsunami categories from MLIT, relayed live per station ID</li>
+<!-- Station Hazard is a LIVE API relay (REST GET /v1/stations/{id}/hazard + MCP get_station_hazard):
+     house policy is to relay official MLIT hazard values as-is — no derived scores, no raw redistribution. -->
+<li><b>Station Hazard API (live)</b> — official flood, liquefaction, landslide, storm-surge &amp; tsunami categories from MLIT, relayed live per station (REST + MCP)</li>
 <li><b>More APIs launching on this data</b> — All Access subscribers get every new one automatically</li>
 </ul>
 
