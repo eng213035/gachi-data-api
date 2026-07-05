@@ -4,7 +4,15 @@
 // - English landing page + free-key form + Business interest form
 // Data served straight from KV (see build_kv_seed*.py). No D1/Stripe-webhook in this lean build.
 
-const PLAN_LIMITS = { free: 1000, pro: 100000, admin: Infinity };
+const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
+
+// Payment Links (Stripe). Pro is live; All Access / Business are placeholders the
+// operator fills in after creating the links in Stripe (Phase 5 human task).
+const PAYMENT_LINKS = {
+  pro: 'https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00',
+  all_access: 'REPLACE_WITH_ALL_ACCESS_PAYMENT_LINK',
+  business: 'REPLACE_WITH_BUSINESS_PAYMENT_LINK',
+};
 
 const TOOLS = [
   {
@@ -139,9 +147,15 @@ function structExit(rawName, m) {
   }
   return { name: exitEn(rawName), name_ja: rawName, distance_m, named: true };
 }
+function toiletNameEn(raw) {
+  const n = raw || '';
+  if (n.includes('多目的')) return 'Multipurpose Toilet';
+  if (n.includes('多機能')) return 'Multifunction Toilet';
+  return 'Accessible Toilet';
+}
 function toEnglishToilet(r) {
   return {
-    name: 'Accessible Toilet',
+    name: toiletNameEn(r.name),
     name_ja: r.name || null,
     type: 'accessible',
     line: lineEn(r.line),
@@ -175,6 +189,85 @@ function toEnglishCity(found) {
       wheelchair: !!t.wheelchair, baby: !!t.baby, ostomate: !!t.ostomate,
       hours: normHours(t.hours),
     })),
+  };
+}
+
+// ---- geohash nearby search (REST /v1/toilets/nearby) ---------------------
+// geo:<geohash5> keys are an additive index built from the same koushu public-toilet
+// data (build_kv_seed_geo.py); raw KV is untouched. A precision-5 cell is ~4.9km, so
+// for a capped radius we only read the point's cell + its 8 neighbours (<=9 KV gets).
+const GH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+function geohashEncode(lat, lon, precision = 5) {
+  let latLo = -90, latHi = 90, lonLo = -180, lonHi = 180;
+  let gh = '', bits = 0, bit = 0, even = true;
+  while (gh.length < precision) {
+    if (even) {
+      const mid = (lonLo + lonHi) / 2;
+      if (lon >= mid) { bits = (bits << 1) | 1; lonLo = mid; } else { bits = bits << 1; lonHi = mid; }
+    } else {
+      const mid = (latLo + latHi) / 2;
+      if (lat >= mid) { bits = (bits << 1) | 1; latLo = mid; } else { bits = bits << 1; latHi = mid; }
+    }
+    even = !even;
+    if (++bit === 5) { gh += GH_BASE32[bits]; bits = 0; bit = 0; }
+  }
+  return gh;
+}
+const GH_NEIGHBORS = {
+  n: ['p0r21436x8zb9dcf5h7kjnmqesgutwvy', 'bc01fg45238967deuvhjyznpkmstqrwx'],
+  s: ['14365h7k9dcfesgujnmqp0r2twvyx8zb', '238967debc01fg45kmstqrwxuvhjyznp'],
+  e: ['bc01fg45238967deuvhjyznpkmstqrwx', 'p0r21436x8zb9dcf5h7kjnmqesgutwvy'],
+  w: ['238967debc01fg45kmstqrwxuvhjyznp', '14365h7k9dcfesgujnmqp0r2twvyx8zb'],
+};
+const GH_BORDERS = {
+  n: ['prxz', 'bcfguvyz'], s: ['028b', '0145hjnp'],
+  e: ['bcfguvyz', 'prxz'], w: ['0145hjnp', '028b'],
+};
+function geohashAdjacent(gh, dir) {
+  gh = gh.toLowerCase();
+  const last = gh.charAt(gh.length - 1);
+  let base = gh.slice(0, -1);
+  const type = gh.length % 2; // 0=even
+  if (GH_BORDERS[dir][type].indexOf(last) !== -1 && base !== '') {
+    base = geohashAdjacent(base, dir);
+  }
+  return base + GH_BASE32[GH_NEIGHBORS[dir][type].indexOf(last)];
+}
+function geohashNeighbors(gh) {
+  const n = geohashAdjacent(gh, 'n'), s = geohashAdjacent(gh, 's');
+  const e = geohashAdjacent(gh, 'e'), w = geohashAdjacent(gh, 'w');
+  return [gh, n, s, e, w,
+    geohashAdjacent(n, 'e'), geohashAdjacent(n, 'w'),
+    geohashAdjacent(s, 'e'), geohashAdjacent(s, 'w')];
+}
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+async function nearbyToilets(env, lat, lng, radius, filters) {
+  const cells = geohashNeighbors(geohashEncode(lat, lng, 5));
+  const gets = await Promise.all(cells.map((c) => env.TOILET_KV.get(`geo:${c}`, 'json')));
+  const out = [];
+  for (const cell of gets) {
+    if (!cell) continue;
+    for (const t of cell.toilets || []) {
+      if (filters.wheelchair && !t.wheelchair) continue;
+      if (filters.ostomate && !t.ostomate) continue;
+      if (filters.diaper && !t.baby) continue; // koushu 'baby' = baby-changing seat
+      const d = haversine(lat, lng, t.lat, t.lon);
+      if (d <= radius) out.push({ ...t, distance_m: Math.round(d) });
+    }
+  }
+  out.sort((a, b) => a.distance_m - b.distance_m);
+  return out;
+}
+function toEnglishNearbyToilet(t) {
+  return {
+    name: t.name, addr: t.addr, lat: t.lat, lon: t.lon, distance_m: t.distance_m,
+    wheelchair: !!t.wheelchair, baby: !!t.baby, ostomate: !!t.ostomate,
+    hours: normHours(t.hours), city: t.city || null,
   };
 }
 
@@ -320,10 +413,113 @@ async function handleRpc(body, env) {
 
 const UPGRADE_URL = 'https://api.gachi-tokusuru.com'; // landing page with pricing
 const PORTAL_URL = 'https://billing.stripe.com/p/login/00w9ATg4B5F5byV2B13Ru00'; // self-serve manage/cancel
+const DOCS_URL = 'https://api.gachi-tokusuru.com/docs';
+
+// Open Datasets (free, citable) — surfaced on the LP and in llms.txt.
+const DATASETS = {
+  github: 'https://github.com/eng213035/gachi-open-datasets',
+  zenodo_doi: '10.5281/zenodo.21199500',
+  zenodo_url: 'https://doi.org/10.5281/zenodo.21199500',
+  kaggle: 'https://www.kaggle.com/datasets/takufujii/japan-station-master-and-ridership-2000-2025-tokyo',
+};
+
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, OPTIONS',
+  'access-control-allow-headers': 'Authorization, Content-Type',
+  'access-control-max-age': '86400',
+};
+
+// REST error envelope (uniform shape, per spec).
+function restError(code, message, status, extraHeaders = {}) {
+  return Response.json(
+    { error: code, message, docs: DOCS_URL },
+    { status, headers: { ...CORS, ...extraHeaders } },
+  );
+}
+function restJson(payload) {
+  return Response.json(payload, { headers: { ...CORS } });
+}
+
+// Auth + shared metering for REST (same key + same monthly counter as MCP).
+async function restAuthAndMeter(request, env) {
+  const auth = await resolveAuth(request, env);
+  if (!auth.ok) {
+    return { error: restError('unauthorized', `Missing or invalid API key. Get a free key at ${UPGRADE_URL}`, 401) };
+  }
+  const m = await meterUsage(env, auth.token, auth.plan);
+  if (!m.allowed) {
+    return {
+      error: restError(
+        'rate_limit_exceeded',
+        `Monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade: ${UPGRADE_URL}`,
+        429,
+        { 'retry-after': '3600' },
+      ),
+    };
+  }
+  return { ok: true, auth };
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // CORS preflight for the REST API
+    if (request.method === 'OPTIONS' && url.pathname.startsWith('/v1/')) {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
+    // ---- REST v1 (thin layer over the same internal functions + i18n as MCP) ----
+    if (request.method === 'GET' && url.pathname === '/v1/station-toilets/search') {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const station = (url.searchParams.get('station') || '').trim();
+      if (!station) return restError('bad_request', 'Query param "station" is required (e.g. ?station=Shinjuku or ?station=新宿).', 400);
+      const tool = TOOLS.find((t) => t.name === 'get_toilet_by_station');
+      const found = await lookup(env, tool.prefix, station);
+      if (!found) return restError('not_found', `No station toilet data for "${station}".`, 404);
+      return restJson({ ...(await toEnglishStation(env, found)), attribution: tool.attribution });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/v1/toilets/nearby') {
+      const gate = await restAuthAndMeter(request, env);
+      if (gate.error) return gate.error;
+      const lat = parseFloat(url.searchParams.get('lat'));
+      const lng = parseFloat(url.searchParams.get('lng'));
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        return restError('bad_request', 'Valid "lat" and "lng" query params are required.', 400);
+      }
+      let radius = parseInt(url.searchParams.get('radius') || '800', 10);
+      if (!Number.isFinite(radius) || radius <= 0) radius = 800;
+      radius = Math.min(radius, 2000); // capped so a fixed 9-cell geohash read fully covers the circle
+      const filters = {
+        wheelchair: url.searchParams.get('wheelchair') === 'true',
+        ostomate: url.searchParams.get('ostomate') === 'true',
+        diaper: url.searchParams.get('diaper') === 'true',
+      };
+      const found = await nearbyToilets(env, lat, lng, radius, filters);
+      const capped = found.slice(0, 50);
+      return restJson({
+        query: { lat, lng, radius_m: radius, ...filters },
+        count: capped.length,
+        toilets: capped.map(toEnglishNearbyToilet),
+        attribution: TOOLS.find((t) => t.name === 'get_public_toilet_by_city').attribution,
+      });
+    }
+
+    // OpenAPI spec + a tiny docs page pointing at it
+    if (request.method === 'GET' && url.pathname === '/openapi.yaml') {
+      return new Response(OPENAPI_YAML, { headers: { 'content-type': 'application/yaml; charset=utf-8', ...CORS } });
+    }
+    if (request.method === 'GET' && url.pathname === '/docs') {
+      return new Response(DOCS_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+
+    // llms.txt — sign-post for agents (project summary, endpoints, datasets, license)
+    if (request.method === 'GET' && url.pathname === '/llms.txt') {
+      return new Response(LLMS_TXT, { headers: { 'content-type': 'text/plain; charset=utf-8', ...CORS } });
+    }
 
     // Landing page
     if (request.method === 'GET' && url.pathname === '/') {
@@ -342,6 +538,7 @@ export default {
         '<?xml version="1.0" encoding="UTF-8"?>\n' +
           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
           '  <url><loc>https://api.gachi-tokusuru.com/</loc></url>\n' +
+          '  <url><loc>https://api.gachi-tokusuru.com/docs</loc></url>\n' +
           '</urlset>\n',
         { headers: { 'content-type': 'application/xml; charset=utf-8' } },
       );
@@ -454,6 +651,111 @@ export default {
   },
 };
 
+// Renders a plan CTA. Real Stripe link -> Subscribe button. Placeholder link
+// (operator hasn't created it yet) -> route to the inquiry form so no dead link ships.
+function payCta(planKey, subscribeNote) {
+  const url = PAYMENT_LINKS[planKey];
+  if (/^https?:\/\//.test(url)) {
+    return `<a href="${url}" target="_blank" rel="noopener"><button type="button">Subscribe</button></a> <span class="mut">${subscribeNote}</span>`;
+  }
+  return `<a href="#bizform"><button type="button">Request access</button></a> <span class="mut">Request access and we'll email your key.</span>`;
+}
+
+const OPENAPI_YAML = `openapi: 3.0.3
+info:
+  title: Gachi Japan Toilet & Accessibility API
+  version: "1.0.0"
+  description: >
+    Structured data on wheelchair-accessible toilets in Tokyo train stations
+    and public toilets across Japan. Same data and response shape as the MCP
+    server. Auth: Authorization: Bearer <API key> (free keys at
+    https://api.gachi-tokusuru.com). Requests count against one shared monthly
+    quota per key (MCP + REST combined).
+servers:
+  - url: https://api.gachi-tokusuru.com
+paths:
+  /v1/station-toilets/search:
+    get:
+      summary: Accessible toilets inside a Tokyo station
+      parameters:
+        - name: station
+          in: query
+          required: true
+          schema: { type: string }
+          description: Station name, English or Japanese (Shinjuku or 新宿).
+      responses:
+        "200": { description: Station toilets (English-first, *_ja companions) }
+        "400": { description: Missing station param }
+        "401": { description: Missing/invalid API key }
+        "404": { description: No data for that station }
+        "429": { description: Monthly quota reached (Retry-After header) }
+  /v1/toilets/nearby:
+    get:
+      summary: Public toilets near a coordinate
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number } }
+        - { name: lng, in: query, required: true, schema: { type: number } }
+        - { name: radius, in: query, required: false, schema: { type: integer, default: 800, maximum: 2000 }, description: metres (capped at 2000) }
+        - { name: wheelchair, in: query, required: false, schema: { type: boolean } }
+        - { name: ostomate, in: query, required: false, schema: { type: boolean } }
+        - { name: diaper, in: query, required: false, schema: { type: boolean } }
+      responses:
+        "200": { description: Nearby public toilets, nearest first (max 50) }
+        "400": { description: Missing/invalid lat or lng }
+        "401": { description: Missing/invalid API key }
+        "429": { description: Monthly quota reached (Retry-After header) }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+security:
+  - bearerAuth: []
+`;
+
+const DOCS_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>API docs — Gachi Japan Toilet API</title>
+<style>body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#1a1a1a}
+code,pre{font-family:ui-monospace,Menlo,monospace}pre{background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:14px;overflow-x:auto;font-size:13px}
+a{color:#0b6}h2{margin-top:32px}</style></head><body>
+<h1>Gachi Japan Toilet &amp; Accessibility API — REST v1</h1>
+<p>Machine-readable spec: <a href="/openapi.yaml">/openapi.yaml</a>. Get a free key at <a href="/">the homepage</a>.
+Auth header on every call: <code>Authorization: Bearer &lt;key&gt;</code>. MCP and REST share one monthly quota per key.</p>
+<h2>Station toilets (English or Japanese station name)</h2>
+<pre>curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\
+  -H "Authorization: Bearer YOUR_API_KEY"</pre>
+<h2>Public toilets near a coordinate</h2>
+<pre>curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&radius=800&wheelchair=true" \\
+  -H "Authorization: Bearer YOUR_API_KEY"</pre>
+<p>Errors are JSON: <code>{"error":"&lt;code&gt;","message":"...","docs":"https://api.gachi-tokusuru.com/docs"}</code>.
+Codes: 400 bad_request, 401 unauthorized, 404 not_found, 429 rate_limit_exceeded (with <code>Retry-After</code>).</p>
+<p><a href="/">← Back to home &amp; pricing</a></p>
+</body></html>`;
+
+const LLMS_TXT = `# Gachi Japan Toilet & Accessibility API / MCP
+
+> Clean, structured data on wheelchair-accessible toilets in Tokyo train stations
+> (with nearest station exit) and public toilets across Japan. For AI agents,
+> travel and accessibility apps. Free tier; MCP + REST share one key.
+
+## API access
+- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_toilet_by_station, get_public_toilet_by_city)
+- REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
+- REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
+- Auth: Authorization: Bearer <key>. Free keys: https://api.gachi-tokusuru.com
+- OpenAPI: https://api.gachi-tokusuru.com/openapi.yaml
+- Pricing: https://api.gachi-tokusuru.com (Free 1k, Pro $19/100k, All Access $49/200k, Business $149/500k, Enterprise bulk)
+
+## Free open datasets (citable, annually updated)
+- Japan Station Master (entity-resolved, 425 stations) + Ridership 2000-2025 (station_id shared)
+- Zenodo DOI: 10.5281/zenodo.21199500  (https://doi.org/10.5281/zenodo.21199500)
+- GitHub: https://github.com/eng213035/gachi-open-datasets
+- Kaggle: https://www.kaggle.com/datasets/takufujii/japan-station-master-and-ridership-2000-2025-tokyo
+
+## License & attribution
+- Data: Tokyo Metropolitan Government (Bureau of Social Welfare) & BODIK municipal open data, CC BY 4.0.
+- English station names via ODPT (Public Transportation Open Data Center).
+- nearest_exit is an original derived value by gachi-tokusuru.com. Accuracy/completeness not guaranteed.
+`;
+
 const LANDING_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -487,7 +789,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </style></head><body><div class="wrap">
 
 <h1>Japan Toilet &amp; Accessibility API <span class="tag">Early access</span></h1>
-<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as an <b>MCP</b> server (REST coming soon).</p>
+<p class="sub">Clean, structured data on wheelchair-accessible &amp; public toilets across Japan — for AI agents, travel &amp; accessibility apps. Available as an <b>MCP</b> server and a <b>REST</b> API — one key works for both.</p>
 
 <div class="demo">
 <b>新宿駅 (Shinjuku) → nearest accessible toilet</b><br>
@@ -507,13 +809,37 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 
 <h2>Pricing <span class="mut">(early-access — early users are grandfathered)</span></h2>
 <table>
-<tr><th>Plan</th><th>Price</th><th>Limit</th><th></th></tr>
-<tr><td class="price">Free</td><td>$0</td><td>1,000 req / mo</td><td>Try it with your agent — full MCP access</td></tr>
-<tr><td class="price">Pro</td><td>$19/mo</td><td>100,000 req / mo</td><td>Production volume — same full MCP access</td></tr>
-<tr><td class="price">Business</td><td>Contact</td><td>—</td><td>Station master (cross-operator), ridership trends &amp; bulk datasets — <i>in development</i></td></tr>
+<tr><th>Plan</th><th>Price</th><th>Requests</th><th></th></tr>
+<tr>
+  <td class="price">Free</td><td>$0</td><td>1,000 / mo</td>
+  <td><i>Try it with your agent</i><br>Full MCP + REST · all current tools · community support (GitHub issues)<br>
+  <button type="button" onclick="document.getElementById('kemail').focus()">Get a free key</button>
+  <br><span class="mut">Your key will be generated instantly upon email verification.</span></td>
+</tr>
+<tr>
+  <td class="price">Pro</td><td>$19/mo</td><td>100,000 / mo</td>
+  <td><i>For individual developers in production</i><br>Full MCP + REST · commercial projects welcome (single developer) · <b>Early access pricing — locked in</b><br>
+  <a href="${PAYMENT_LINKS.pro}" target="_blank" rel="noopener"><button type="button">Subscribe</button></a>
+  <span class="mut"> — your key is shown instantly after checkout.</span></td>
+</tr>
+<tr>
+  <td class="price">All Access</td><td>$49/mo</td><td>200,000 / mo <span class="mut">(shared pool, fair use)</span></td>
+  <td><i>Every API we ship, one key</i><br>All current + upcoming APIs (station master, ridership, hazard — <b>as they launch</b>), included automatically · single developer license<br>
+  ${payCta('all_access', "you'll receive your API key by email within 24 hours.")}</td>
+</tr>
+<tr>
+  <td class="price">Business</td><td>$149/mo</td><td>500,000 / mo <span class="mut">(shared pool)</span></td>
+  <td><i>For teams and companies</i><br>Team key sharing (multiple seats) · embed in your company's products &amp; internal systems (no redistribution of raw data) · all current + upcoming APIs included<br>
+  ${payCta('business', "you'll receive your API key by email within 24 hours.")}</td>
+</tr>
+<tr>
+  <td class="price">Enterprise</td><td>from $2,500/yr</td><td>Bulk</td>
+  <td><i>Bulk data &amp; redistribution rights</i><br>Full dataset exports (Parquet/CSV): station master, ridership, accessibility, hazard · commercial redistribution license · annual data updates included · invoice billing available · best-effort email support<br>
+  <a href="#bizform"><button type="button">Contact us</button></a></td>
+</tr>
 </table>
-<p><a href="https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00" target="_blank" rel="noopener"><b>Subscribe to Pro — $19/mo →</b></a> <span class="mut">(your Pro key, 100K req/mo, is shown instantly after checkout)</span></p>
-<p class="mut">Already Pro? <a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription</a> anytime.</p>
+<p class="mut">Free, Pro and All Access are licensed to a single individual developer — commercial projects welcome. Teams and companies, please use Business or above.</p>
+<p class="mut">Already subscribed? <a href="${PORTAL_URL}" target="_blank" rel="noopener">Manage or cancel your subscription</a> anytime.</p>
 
 <h2>Get a free API key</h2>
 <p class="mut">Enter your email — your key is issued instantly on this page (1,000 req/mo, no card required).</p>
@@ -533,16 +859,31 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
   }
 }</pre>
 
-<h2>Try it with curl</h2>
+<h2>Try it with curl (MCP)</h2>
 <pre>curl -X POST https://api.gachi-tokusuru.com/mcp \\
   -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
        "params":{"name":"get_toilet_by_station","arguments":{"station":"Shinjuku"}}}'</pre>
 
-<p class="mut">Prefer a plain REST endpoint over MCP? It's on the roadmap — <a href="#bizform">tell us your use case</a> and we'll prioritize it.</p>
+<h2>Or plain REST <span class="mut">(same data, same key — <a href="/docs">docs</a> · <a href="/openapi.yaml">openapi.yaml</a>)</span></h2>
+<pre>curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\
+  -H "Authorization: Bearer YOUR_API_KEY"
 
-<h2>Business / bulk data</h2>
-<p class="mut">Interested in the upcoming cross-operator station master, ridership trends &amp; bulk datasets? Tell us what you'd use — it directly shapes what we build next.</p>
+curl "https://api.gachi-tokusuru.com/v1/toilets/nearby?lat=35.6896&lng=139.7006&radius=800&wheelchair=true" \\
+  -H "Authorization: Bearer YOUR_API_KEY"</pre>
+
+<h2>Free open datasets</h2>
+<p>Prefer the raw data? Our station master &amp; ridership datasets are free, citable and annually updated —
+<b>station master (cross-operator, entity-resolved) &amp; ridership 2000–2025</b>.</p>
+<ul>
+<li><a href="${DATASETS.github}" target="_blank" rel="noopener">GitHub</a> — source + build pipeline</li>
+<li><a href="${DATASETS.zenodo_url}" target="_blank" rel="noopener">Zenodo</a> — DOI <code>${DATASETS.zenodo_doi}</code> (citable archive)</li>
+<li><a href="${DATASETS.kaggle}" target="_blank" rel="noopener">Kaggle</a> — notebooks &amp; discovery</li>
+</ul>
+<p class="mut">The newest survey year reaches API subscribers first; it lands in the free dataset at the next annual release.</p>
+
+<h2 id="bizform-anchor">Business / Enterprise inquiry</h2>
+<p class="mut">For bulk dataset exports, redistribution rights, or team use — tell us what you'd use it for and we'll follow up. Upcoming APIs (station master, ridership, hazard) are included in the relevant plans <b>as they launch</b>.</p>
 <form id="bizform">
 <input type="email" id="bemail" placeholder="you@example.com" required>
 <textarea id="buse" rows="2" placeholder="What would you use it for? (1 line)" required></textarea>
