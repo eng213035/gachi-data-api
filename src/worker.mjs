@@ -10,7 +10,7 @@ const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500
 // operator fills in after creating the links in Stripe (Phase 5 human task).
 const PAYMENT_LINKS = {
   pro: 'https://buy.stripe.com/00w9ATg4B5F5byV2B13Ru00',
-  all_access: 'REPLACE_WITH_ALL_ACCESS_PAYMENT_LINK',
+  all_access: 'https://buy.stripe.com/6oU8wP05D2sTdH36Rh3Ru02',
   business: 'REPLACE_WITH_BUSINESS_PAYMENT_LINK',
 };
 
