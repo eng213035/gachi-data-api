@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'station-context-name-clearer-errors',
-  built: '2026-07-06T10:35:00Z',
-  build: 'get-station-context-name-or-id-v2',
+  commit: 'oauth-2.1-remote-mcp',
+  built: '2026-07-06T11:30:00Z',
+  build: 'oauth-discovery-dcr-pkce-token',
   pricing_tiers: 5,
 };
 
@@ -615,6 +615,54 @@ async function issueFreeKey(env, email) {
   return token;
 }
 
+// ---- OAuth 2.1 (MCP remote auth for claude.ai web / Desktop connectors) ------
+// Same-origin authorization server + resource server. Access tokens ARE free keys
+// (stored as key:<token>), so resolveAuth + metering are reused unchanged. PKCE S256
+// mandatory; RFC 7591 dynamic client registration; loopback + claude.ai hosted redirects.
+const OAUTH_ISSUER = 'https://api.gachi-tokusuru.com';
+const OAUTH_RESOURCE = 'https://api.gachi-tokusuru.com/mcp';
+const OAUTH_SCOPE = 'mcp';
+function b64url(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function sha256b64url(str) {
+  return b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)));
+}
+function isLoopbackHost(h) { return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]'; }
+// Exact match, or loopback with port-agnostic path match (RFC 8252 §7.3).
+function oauthRedirectAllowed(uri, registered) {
+  if (!uri) return false;
+  if (registered.includes(uri)) return true;
+  try {
+    const u = new URL(uri);
+    if (!isLoopbackHost(u.hostname)) return false;
+    return registered.some((r) => { try { const ru = new URL(r); return isLoopbackHost(ru.hostname) && ru.pathname === u.pathname; } catch { return false; } });
+  } catch { return false; }
+}
+function protectedResourceMetadata() {
+  return { resource: OAUTH_RESOURCE, authorization_servers: [OAUTH_ISSUER], scopes_supported: [OAUTH_SCOPE], bearer_methods_supported: ['header'], resource_name: 'Gachi Data API', resource_documentation: `${OAUTH_ISSUER}/docs` };
+}
+function authServerMetadata() {
+  return { issuer: OAUTH_ISSUER, authorization_endpoint: `${OAUTH_ISSUER}/authorize`, token_endpoint: `${OAUTH_ISSUER}/token`, registration_endpoint: `${OAUTH_ISSUER}/register`, response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], scopes_supported: [OAUTH_SCOPE] };
+}
+function oauthTokenErr(error, desc) {
+  return Response.json({ error, error_description: desc }, { status: 400, headers: { ...CORS, 'cache-control': 'no-store' } });
+}
+function oauthErrPage(error, desc) {
+  return new Response(`<!doctype html><meta charset="utf-8"><title>Authorization error</title><div style="font:16px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;max-width:460px;margin:60px auto;padding:0 20px;color:#1a1a1a"><h1 style="font-size:20px">Authorization error</h1><p><b>${error}</b></p><p>${desc}</p></div>`, { status: 400, headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+function oauthConsentPage(reqUrl) {
+  const approve = new URL(reqUrl); approve.searchParams.set('approve', '1');
+  const href = approve.toString().replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize — Gachi Data API</title></head><body><div style="font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:460px;margin:56px auto;padding:0 20px;color:#1a1a1a">
+<h1 style="font-size:22px;margin:0 0 8px">Connect to Gachi Data API</h1>
+<p>You're authorizing an MCP client to query <b>Gachi Data API</b> — Japan station, accessibility &amp; hazard data — on the <b>free tier</b> (1,000 requests/month).</p>
+<p style="color:#666;font-size:14px">No account needed. A free-tier key is created for this connection; disconnect anytime to stop using it.</p>
+<p style="margin-top:22px"><a href="${href}" style="display:inline-block;background:#0b6;color:#fff;text-decoration:none;padding:11px 22px;border-radius:6px;font-weight:600">Authorize</a></p>
+<p style="color:#999;font-size:12px;margin-top:28px">Powered by api.gachi-tokusuru.com · <a href="/docs" style="color:#0b6">docs</a></p>
+</div></body></html>`, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
 async function issuePaidKey(env, plan, { email, customer, session }) {
   const meta = PLAN_META[plan];
   const token = randToken(meta.prefix);
@@ -1114,6 +1162,74 @@ export default {
       );
     }
 
+    // ---- OAuth 2.1 (remote MCP auth; enables claude.ai web / Desktop connectors) ----
+    if (request.method === 'GET' && (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp')) {
+      return Response.json(protectedResourceMetadata(), { headers: { ...CORS, 'cache-control': 'public, max-age=3600' } });
+    }
+    if (request.method === 'GET' && (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/oauth-authorization-server/mcp')) {
+      return Response.json(authServerMetadata(), { headers: { ...CORS, 'cache-control': 'public, max-age=3600' } });
+    }
+    // Dynamic Client Registration (RFC 7591): public client, no secret.
+    if (request.method === 'POST' && url.pathname === '/register') {
+      let b; try { b = await request.json(); } catch { b = {}; }
+      const redirect_uris = Array.isArray(b?.redirect_uris) ? b.redirect_uris.filter((x) => typeof x === 'string').slice(0, 10) : [];
+      const client_id = randToken('oc_');
+      await env.TOILET_KV.put(`oauthclient:${client_id}`, JSON.stringify({ redirect_uris, client_name: String(b?.client_name || '').slice(0, 120), created: new Date().toISOString() }), { expirationTtl: 34560000 });
+      return Response.json({
+        client_id, client_id_issued_at: Math.floor(Date.now() / 1000), redirect_uris,
+        grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
+        token_endpoint_auth_method: 'none', client_name: String(b?.client_name || '') || undefined,
+      }, { status: 201, headers: { ...CORS, 'cache-control': 'no-store' } });
+    }
+    // Authorization endpoint (PKCE S256 mandatory; explicit-consent via ?approve=1).
+    if (request.method === 'GET' && url.pathname === '/authorize') {
+      const q = url.searchParams;
+      if ((q.get('response_type') || '') !== 'code') return oauthErrPage('unsupported_response_type', 'Only response_type=code is supported.');
+      const cc = q.get('code_challenge') || '';
+      if ((q.get('code_challenge_method') || '') !== 'S256' || !cc) return oauthErrPage('invalid_request', 'PKCE with code_challenge_method=S256 is required.');
+      const client_id = q.get('client_id') || '';
+      const client = client_id ? await env.TOILET_KV.get(`oauthclient:${client_id}`, 'json') : null;
+      if (!client) return oauthErrPage('invalid_client', 'Unknown client_id — register at /register first.');
+      const redirect_uri = q.get('redirect_uri') || '';
+      if (!oauthRedirectAllowed(redirect_uri, client.redirect_uris || [])) return oauthErrPage('invalid_request', 'redirect_uri is not registered for this client.');
+      if (q.get('approve') !== '1') return oauthConsentPage(url);
+      const code = randToken('ac_');
+      await env.TOILET_KV.put(`oauthcode:${code}`, JSON.stringify({ client_id, redirect_uri, code_challenge: cc, scope: q.get('scope') || OAUTH_SCOPE, resource: q.get('resource') || OAUTH_RESOURCE, created: Date.now() }), { expirationTtl: 600 });
+      const back = new URL(redirect_uri);
+      back.searchParams.set('code', code);
+      if (q.get('state')) back.searchParams.set('state', q.get('state'));
+      return Response.redirect(back.toString(), 302);
+    }
+    // Token endpoint: authorization_code (PKCE verify) + refresh_token (rotating). access_token = free key.
+    if (request.method === 'POST' && url.pathname === '/token') {
+      const form = new URLSearchParams(await request.text());
+      const grant = form.get('grant_type') || '';
+      if (grant === 'authorization_code') {
+        const code = form.get('code') || '';
+        const rec = code ? await env.TOILET_KV.get(`oauthcode:${code}`, 'json') : null;
+        if (!rec) return oauthTokenErr('invalid_grant', 'Authorization code invalid or expired.');
+        await env.TOILET_KV.delete(`oauthcode:${code}`); // single-use
+        if (rec.client_id !== (form.get('client_id') || '')) return oauthTokenErr('invalid_grant', 'client_id mismatch.');
+        if (rec.redirect_uri !== (form.get('redirect_uri') || '')) return oauthTokenErr('invalid_grant', 'redirect_uri mismatch.');
+        const verifier = form.get('code_verifier') || '';
+        if (!verifier || (await sha256b64url(verifier)) !== rec.code_challenge) return oauthTokenErr('invalid_grant', 'PKCE verification failed.');
+        const accessToken = await issueFreeKey(env, 'oauth:' + (rec.client_id || 'connector'));
+        const refreshToken = randToken('rt_');
+        await env.TOILET_KV.put(`oauthrefresh:${refreshToken}`, JSON.stringify({ key: accessToken, client_id: rec.client_id }), { expirationTtl: 34560000 });
+        return Response.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 2592000, refresh_token: refreshToken, scope: rec.scope || OAUTH_SCOPE }, { headers: { ...CORS, 'cache-control': 'no-store' } });
+      }
+      if (grant === 'refresh_token') {
+        const rt = form.get('refresh_token') || '';
+        const rr = rt ? await env.TOILET_KV.get(`oauthrefresh:${rt}`, 'json') : null;
+        if (!rr) return oauthTokenErr('invalid_grant', 'Refresh token invalid.');
+        await env.TOILET_KV.delete(`oauthrefresh:${rt}`); // rotate (OAuth 2.1 public-client)
+        const newRt = randToken('rt_');
+        await env.TOILET_KV.put(`oauthrefresh:${newRt}`, JSON.stringify({ key: rr.key, client_id: rr.client_id }), { expirationTtl: 34560000 });
+        return Response.json({ access_token: rr.key, token_type: 'Bearer', expires_in: 2592000, refresh_token: newRt, scope: OAUTH_SCOPE }, { headers: { ...CORS, 'cache-control': 'no-store' } });
+      }
+      return oauthTokenErr('unsupported_grant_type', 'Supported: authorization_code, refresh_token.');
+    }
+
     // ---- REST v1 (thin layer over the same internal functions + i18n as MCP) ----
 
     // Live hazard relay: official MLIT hazard values/categories at a station's location.
@@ -1452,7 +1568,7 @@ export default {
         if (!auth.ok) {
           return Response.json(
             rpcError(body.id ?? null, -32001, 'unauthorized: get a free key at ' + UPGRADE_URL),
-            { status: 401 },
+            { status: 401, headers: { 'WWW-Authenticate': `Bearer resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="${OAUTH_SCOPE}"`, ...CORS } },
           );
         }
         // Context API tools honour the same Free 1-municipality/day preview gate as REST.
