@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'mail-from-gachi-tokusuru',
-  built: '2026-07-06T07:40:00Z',
-  build: 'switch-sender-to-verified-gachi-tokusuru',
+  commit: 'live-sample-two-layer-tables',
+  built: '2026-07-06T09:10:00Z',
+  build: 'live-sample-html-tables-plus-raw-json',
   pricing_tiers: 5,
 };
 
@@ -1893,7 +1893,29 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 11 accessible toilets, each mapped to its <b>nearest station exit</b> — first-party data you won't find anywhere else.
 </div>
 
-<p><a href="/example" target="_blank" rel="noopener"><b>▶ See a live sample response</b></a> — no key needed, real JSON.</p>
+<p><b>新宿駅 (Shinjuku) — accessible toilets</b> <span class="mut">(live, no key)</span></p>
+<div style="overflow-x:auto">
+<table>
+<tr><th>Toilet</th><th>Line</th><th>Floor</th><th>Nearest exit</th><th>Dist.</th><th>Equipment</th></tr>
+<tr><td>Accessible Toilet</td><td>Marunouchi Line</td><td>B1F</td><td>Exit A8</td><td>11 m</td><td>♿ · ostomate · <span title="baby-changing table">👶</span></td></tr>
+<tr><td>Multifunction Toilet</td><td>Keio Line</td><td>B1F</td><td>Exit S01</td><td>12 m</td><td>♿ · ostomate</td></tr>
+<tr><td>Multipurpose Toilet</td><td>Yamanote Line / Chuo Line</td><td>B1F</td><td>East Gate</td><td>29 m</td><td>♿ · ostomate · <span title="baby-changing table">👶</span></td></tr>
+</table>
+</div>
+<p class="mut"><b>nearest exit distance is first-party data — found nowhere else.</b> &nbsp;(<span title="wheelchair-accessible">♿</span> wheelchair · 👶 baby-changing table)</p>
+
+<p><b>武蔵小杉駅 (Musashi-Kosugi) — official hazard categories</b> <span class="mut">(live MLIT relay)</span></p>
+<div style="overflow-x:auto">
+<table>
+<tr><th>Hazard</th><th>Category at this station</th></tr>
+<tr><td>Flood inundation</td><td>0.5–3.0 m <span class="mut">(rivers: 多摩川 · 大栗川 · 浅川)</span></td></tr>
+<tr><td>Liquefaction</td><td>Somewhat prone — backmarsh landform <span class="mut">(後背湿地)</span></td></tr>
+<tr><td>Storm surge</td><td>Within inundation area</td></tr>
+</table>
+</div>
+<p class="mut">Official MLIT categories, relayed as-is — no derived score. Not a substitute for official hazard maps.</p>
+
+<p><a href="/example" target="_blank" rel="noopener"><b>▼ See the raw JSON — this exact response, live</b></a> — no key needed. <span class="mut">(hazard JSON needs a free key — see <a href="/docs#data-stories">/docs</a>)</span></p>
 <p><a href="/example/train-status" target="_blank" rel="noopener"><b>▶ Train status right now</b></a> — live JSON, no key needed.</p>
 <p><a href="/example/alerts" target="_blank" rel="noopener"><b>▶ Active flood &amp; landslide alerts right now</b></a> — usually zero, and that's honest.</p>
 
