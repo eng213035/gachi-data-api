@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'lp-v5-kaggle-gachidata',
-  built: '2026-07-05T16:40:00Z',
-  build: 'lp-v5-kaggle-url-swap',
+  commit: 'attribution-audit-fixes',
+  built: '2026-07-05T17:20:00Z',
+  build: 'attr-livability-source-llms-attribution',
   pricing_tiers: 5,
 };
 
@@ -995,7 +995,7 @@ async function buildContext(env, muni, fields) {
   }
   if (want('livability')) {
     const t = muni.livability?.transit || {};
-    out.livability = { transit: { nearest_station_km: t.nearest_station_km ?? null, bus_stops_within_1km: t.bus_stops_within_1km ?? null, bus_stops_basis: 'count within 1 km of the municipality centroid (representative point) — density near the town centre, not whole-municipality coverage' } };
+    out.livability = { transit: { nearest_station_km: t.nearest_station_km ?? null, bus_stops_within_1km: t.bus_stops_within_1km ?? null, bus_stops_basis: 'count within 1 km of the municipality centroid (representative point) — density near the town centre, not whole-municipality coverage', source: BUSSTOP_ATTR.source, derived: 'nearest_station_km and bus_stops_within_1km are computed by gachi-tokusuru.com via spatial join from the municipality centroid; bus-stop points from ' + BUSSTOP_ATTR.source + ', nearest station from the Japan Station Master (ODPT + MLIT N02).' } };
     if (t.bus_stops_within_1km != null) attribution.push(BUSSTOP_ATTR);
   }
   const seen = new Set();
@@ -1801,9 +1801,13 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 - Kaggle: https://www.kaggle.com/datasets/gachidata/japan-stations-ridership-and-akiya-2003-2025
 
 ## License & attribution
-- Data: Tokyo Metropolitan Government (Bureau of Social Welfare) & BODIK municipal open data, CC BY 4.0.
-- English station names via ODPT (Public Transportation Open Data Center).
-- nearest_exit is an original derived value by gachi-tokusuru.com. Accuracy/completeness not guaranteed.
+- Accessible & public toilets: Tokyo Metropolitan Government (Bureau of Social Welfare) & BODIK municipal open data (CC BY 4.0).
+- Station names & train service status: ODPT (Public Transportation Open Data Center), CC BY 4.0.
+- Hazard categories, future population, land price: MLIT 不動産情報ライブラリ (Real Estate Information Library) — official values relayed as-is per request; not a government-created dataset.
+- River flood forecasts & landslide alerts: JMA (Japan Meteorological Agency, 気象庁) — relayed as published, not warnings issued by this service.
+- Housing vacancy & municipality codes: Statistics Bureau of Japan (住宅・土地統計調査) via e-Stat, & MIC (総務省).
+- Nationwide stations & bus stops: MLIT 国土数値情報 N02/P11; English station names partly via Wikidata (CC0).
+- Derived by gachi-tokusuru.com (distinct from official values above): nearest_exit, nearest_station_km, and bus-stop counts are computed via spatial join. Accuracy/completeness not guaranteed.
 `;
 
 const LANDING_HTML = `<!doctype html>
