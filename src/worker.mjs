@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'attribution-source-links',
-  built: '2026-07-05T17:50:00Z',
-  build: 'footer-llms-primary-source-links',
+  commit: 'enterprise-copy-vacancy-hazard-note',
+  built: '2026-07-05T18:10:00Z',
+  build: 'enterprise-bulk-vacancy-hazard-caveat',
   pricing_tiers: 5,
 };
 
@@ -1935,7 +1935,7 @@ footer{margin-top:48px;color:var(--mut);font-size:13px;border-top:1px solid var(
 </tr>
 <tr>
   <td class="price">Enterprise</td><td>from $2,500/yr</td><td>Bulk exports</td>
-  <td><i>Bulk data &amp; redistribution rights</i><br>Full dataset exports (Parquet/CSV): station master, ridership, accessibility, hazard <span class="mut">(in preparation)</span> · commercial redistribution license · annual data updates included · invoice billing · best-effort email support<br>
+  <td><i>Bulk data &amp; redistribution rights</i><br>Full dataset exports (Parquet/CSV): station master, ridership, accessibility &amp; housing vacancy · commercial redistribution license · annual data updates included · invoice billing · best-effort email support. <span class="mut">(Hazard is live-API only — upstream license restricts bulk redistribution.)</span><br>
   <a href="#bizform-anchor"><button type="button">Contact us</button></a></td>
 </tr>
 </table>
