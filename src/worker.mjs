@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'enterprise-copy-vacancy-hazard-note',
-  built: '2026-07-05T18:10:00Z',
-  build: 'enterprise-bulk-vacancy-hazard-caveat',
+  commit: 'interest-email-notify-fix-from-domain',
+  built: '2026-07-06T06:40:00Z',
+  build: 'interest-notify-and-piachan-from-domain',
   pricing_tiers: 5,
 };
 
@@ -635,9 +635,15 @@ async function issuePaidKey(env, plan, { email, customer, session }) {
 // a no-op unless RESEND_API_KEY is configured (so activation works with or without email). The
 // /activate page stays the primary delivery. Idempotency is handled by the caller: this only runs
 // on first issuance (a revisit hits the session cache and returns before reaching here).
+// Verified Resend sending domain is piachan.com. gachi-tokusuru.com is inbound Email Routing only
+// (NOT a verified sender), so sending "from" it makes Resend reject the message (403). Override with
+// the MAIL_FROM secret if the verified domain changes.
+const MAIL_FROM_DEFAULT = 'Gachi Data API <noreply@piachan.com>';
+const NOTIFY_EMAIL_DEFAULT = 'contact@gachi-tokusuru.com';
+
 async function sendKeyEmail(env, { email, plan, key }) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: 'disabled_or_no_email' };
-  const from = env.MAIL_FROM || 'Gachi Data API <noreply@gachi-tokusuru.com>';
+  const from = env.MAIL_FROM || MAIL_FROM_DEFAULT;
   const label = PLAN_META[plan]?.label || plan;
   const limit = (PLAN_LIMITS[plan] || 0).toLocaleString('en-US');
   const text =
@@ -661,6 +667,34 @@ async function sendKeyEmail(env, { email, plan, key }) {
     return { sent: resp.ok, status: resp.status };
   } catch (e) {
     console.log(`sendKeyEmail error: ${e.message}`);
+    return { sent: false, reason: e.message };
+  }
+}
+
+// Notify the operator when a new lead arrives via the /interest form. Best-effort: never throws,
+// no-op unless RESEND_API_KEY is set. To-address defaults to contact@gachi-tokusuru.com (inbound
+// Email Routing → your inbox); override with the NOTIFY_EMAIL secret.
+async function sendInterestNotification(env, { email, useCase, id }) {
+  if (!env.RESEND_API_KEY) return { sent: false, reason: 'disabled' };
+  const from = env.MAIL_FROM || MAIL_FROM_DEFAULT;
+  const to = env.NOTIFY_EMAIL || NOTIFY_EMAIL_DEFAULT;
+  const text =
+    `New lead from the Gachi Data API contact form.\n\n` +
+    `Email:    ${email}\n` +
+    `Use case: ${useCase}\n` +
+    `KV key:   interest:${id}\n` +
+    `Time:     ${new Date().toISOString()}\n\n` +
+    `Reply directly to ${email}.`;
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], reply_to: email, subject: `New lead — ${email}`, text }),
+    });
+    if (!resp.ok) console.log(`sendInterestNotification: resend HTTP ${resp.status}`);
+    return { sent: resp.ok, status: resp.status };
+  } catch (e) {
+    console.log(`sendInterestNotification error: ${e.message}`);
     return { sent: false, reason: e.message };
   }
 }
@@ -712,6 +746,7 @@ async function saveInterest(env, email, useCase) {
     `interest:${id}`,
     JSON.stringify({ email, use_case: useCase, created: new Date().toISOString() }),
   );
+  return id;
 }
 
 // ---- MCP JSON-RPC --------------------------------------------------------
@@ -1054,7 +1089,7 @@ async function stationContextPayload(env, stationId, fields) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // CORS preflight for the REST API
@@ -1389,7 +1424,9 @@ export default {
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !useCase) {
         return Response.json({ error: 'email and use_case required' }, { status: 400 });
       }
-      await saveInterest(env, email, useCase);
+      const interestId = await saveInterest(env, email, useCase);
+      // Fire-and-forget operator notification; must not block or fail the form response.
+      ctx.waitUntil(sendInterestNotification(env, { email, useCase, id: interestId }));
       return Response.json({ ok: true });
     }
 
