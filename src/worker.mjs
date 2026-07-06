@@ -6,9 +6,9 @@
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'interest-email-notify-fix-from-domain',
-  built: '2026-07-06T06:40:00Z',
-  build: 'interest-notify-and-piachan-from-domain',
+  commit: 'mail-from-gachi-tokusuru',
+  built: '2026-07-06T07:40:00Z',
+  build: 'switch-sender-to-verified-gachi-tokusuru',
   pricing_tiers: 5,
 };
 
@@ -635,10 +635,10 @@ async function issuePaidKey(env, plan, { email, customer, session }) {
 // a no-op unless RESEND_API_KEY is configured (so activation works with or without email). The
 // /activate page stays the primary delivery. Idempotency is handled by the caller: this only runs
 // on first issuance (a revisit hits the session cache and returns before reaching here).
-// Verified Resend sending domain is piachan.com. gachi-tokusuru.com is inbound Email Routing only
-// (NOT a verified sender), so sending "from" it makes Resend reject the message (403). Override with
-// the MAIL_FROM secret if the verified domain changes.
-const MAIL_FROM_DEFAULT = 'Gachi Data API <noreply@piachan.com>';
+// gachi-tokusuru.com is a verified Resend sending domain (DKIM/SPF/bounce-MX, ap-northeast-1;
+// verified 2026-07-06). Send "from" it for brand consistency. Override with the MAIL_FROM secret
+// if the verified domain changes.
+const MAIL_FROM_DEFAULT = 'Gachi Data API <noreply@gachi-tokusuru.com>';
 const NOTIFY_EMAIL_DEFAULT = 'contact@gachi-tokusuru.com';
 
 async function sendKeyEmail(env, { email, plan, key }) {
