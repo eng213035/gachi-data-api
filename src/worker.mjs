@@ -70,9 +70,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'station-search-softboost-v1',
-  built: '2026-07-31T16:00:00Z',
-  build: 'station_search soft-filter fix: soft_matched partition replaced by score-add ranking — final_score = similarity + SOFT_FILTER_BOOST(0.005 provisional) for stations matching all inferred soft (facility) filters, single-key sort, final_score in response, soft_filters[].mode wording aligned with implementation. Boost stays below the pool similarity spread so unknown-coverage prefectures can still outrank on similarity. Prior deploy: station-search-quality-v2.',
+  commit: 'toilet-dedup-romaji-namecontains-v1',
+  built: '2026-07-31T18:30:00Z',
+  build: 'P1-P3 batch: (P1) toilet dedup — 12 duplicate records removed (full-field-equality key, photos merged), station keys normalized (渋谷駅→渋谷 = +1 Ginza-line toilet now visible, 羽田空港第３→第3 zen/hankaku unified, 練馬駅/木場駅/虎ノ門ヒルズ駅/新大久保駅 → base names; 526→524 station keys, 782→770 toilet records); (P2-b) romaji lookup for 291 non-ODPT stations from audited Station Master names (eng:/romaji: KV, station_name_source=romaji_generated, macron-folded normalization) — japanese_fallback 293→0; (P2-a) station_search name_contains substring filter (station:names table + getByIds ranking + name_matches_total); (P3-a) gate/gate_ja restored by parsing 改札内/外 from toilet names + gate_status column (12 records); soft-filter BOOST finalized at 0.005 (7-query constant-vs-relative bench; relative rejected — spread is outlier-driven). Prior deploy: spice-level-v1.',
   pricing_tiers: 5,
 };
 
@@ -309,8 +309,9 @@ const TOOLS = [
       'filters on the official liquefaction-tendency category; results carry risk_notes when other official hazard ' +
       'categories are high. Inferred facility filters with partial data coverage (おむつ/車椅子 — Tokyo-only data) ' +
       'BOOST confirmed stations instead of excluding unknowns (see soft_filters); explicit params remain strict. ' +
-      'Taste/quality words (うまい/delicious…) are not evaluated (no review data); ramen ranking reflects density ' +
-      'and variety only. ' +
+      'Taste/quality words (うまい, "good food", delicious…) are not evaluated (no review data); ramen ranking ' +
+      'reflects shop density and style variety only. name_contains gives exact substring matching on station names ' +
+      '(日本語/romaji) when the name itself is the requirement. ' +
       'Coverage notes: toilet stats = Tokyo stations only; ridership = Greater Tokyo operators only; hazard = ' +
       'official MLIT categories relayed as-is, NOT a safety judgment. ' +
       'Role split: station_search finds candidate stations — then get_toilet_by_station / search_ramen / ' +
@@ -319,8 +320,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         q: { type: 'string', description: 'Natural-language description of the station/area you want (ja/en). Concrete attribute words (朝ラー, wheelchair toilet, terminal, 水害リスク低) match best.' },
+        name_contains: { type: 'string', description: 'Substring filter on the station name (matches both 日本語 name_ja and romaji name, e.g. "谷" or "sakura"). ANDs with other filters; q still ranks the matches. Use for "stations whose name contains X" requests that semantic search cannot guarantee.' },
         pref: { type: 'string', description: 'Optional prefecture filter, Japanese (東京都, 千葉 OK) or romaji (tokyo/osaka). Auto-inferred from the query text when omitted.' },
-        limit: { type: 'number', description: 'Max results (default 10, max 20).' },
+        limit: { type: 'number', description: 'Max results (default 10; max 20, or 300 when name_contains is given — set limit >= name_matches_total for exhaustive name-match coverage).' },
         morning_ramen: { type: 'boolean', description: 'Require morning-ramen availability nearby (auto-inferred from 朝ラー/morning…).' },
         late_ramen: { type: 'boolean', description: 'Require late-night ramen nearby (auto-inferred from 深夜/late night…).' },
         ramen_min: { type: 'number', description: 'Require at least this many ramen shops nearby (e.g. 30).' },
@@ -542,7 +544,8 @@ const TOOL_OUTPUT_SCHEMAS = {
   }, 'Official disaster-risk categories at a station (MLIT relay).'),
   station_search: openObj({
     query: s('Echo of the query.'), count: s('Results returned.'),
-    applied_filters: obj('Hard metadata filters actually applied (explicit + inferred).'),
+    applied_filters: obj('Hard metadata filters actually applied (explicit + inferred; includes name_contains when given).'),
+    name_matches_total: s('Total stations whose name matched name_contains (before ranking/limit). Present only in name_contains mode.'),
     soft_filters: arr('Inferred facility filters applied as a score BOOST (confirmed stations get +BOOST on similarity = final_score; unknown/missing never excluded), with coverage note. Present only when active.'),
     filter_source: s('explicit / inferred / none — how the filters were chosen.'),
     stations: arr('Matching stations, best first: name, pref, similarity, ramen stats, toilet stats, official hazard categories (plus risk_notes when an official hazard category not covered by the filter is high), lines, ridership.'),
@@ -594,8 +597,9 @@ async function lookup(env, prefix, query) {
   if (exact) return exact;
 
   // romaji alias: "Shinjuku" / "Kita-Senju" -> 日本語駅名 (station prefix only)
+  // 正規化 = 小文字化 → マクロン折り畳み(ō→o等・NFD分解で結合記号除去) → 非英数除去
   if (prefix === 'toilet:' && /[a-zA-Z]/.test(query)) {
-    const norm = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const norm = query.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
     const ja = await env.TOILET_KV.get(`romaji:${norm}`);
     if (ja) {
       const viaRomaji = await env.TOILET_KV.get(`${prefix}${ja}`, 'json');
@@ -695,11 +699,13 @@ function toEnglishToilet(r) {
   };
 }
 async function toEnglishStation(env, found) {
+  // en: = ODPT公式英語名 / eng: = Station Master由来の生成別名(P2-b) — 由来を混同しない
   const en = await env.TOILET_KV.get(`en:${found.station}`);
+  const eng = en ? null : await env.TOILET_KV.get(`eng:${found.station}`);
   return {
-    station: en || found.station,
+    station: en || eng || found.station,
     station_ja: found.station,
-    station_name_source: en ? 'odpt' : 'japanese_fallback',
+    station_name_source: en ? 'odpt' : eng ? 'romaji_generated' : 'japanese_fallback',
     count: found.count,
     layer: found.layer ?? null,     // 'in_station_gate' = 改札内/外つき(都外主要駅) / null = 東京都福祉局の多目的
     toilets: (found.toilets || []).map(toEnglishToilet),
@@ -2150,11 +2156,13 @@ function stationInferPref(q) {
 // 品質・味の語は評価しない(レビューデータ無し)ことの正直な宣言に使う検知。
 const STATION_TASTE_WORDS = /うまい|旨い|美味い|美味しい|おいしい|絶品|名店|delicious|tasty|good\s+(food|ramen|eats)|best\s+(food|ramen)/i;
 
-// softフィルタ一致への加算値(final_score = similarity + BOOST)。暫定値0.005(2026-07-31決裁・
-// 確定値は定数vs相対式(k×pool_spread)ベンチ後に再決裁)。
-// 制約: BOOSTが「プール内の max(sim of false) − min(sim of true)」を超えると事実上の二分割に戻り
-// データ欠損県が常に沈む(P0検証クエリでは閾値0.0115)。bge-m3のtop20プールsim幅は~0.02なので、
-// その1/4程度=同帯タイブレークに留める。
+// softフィルタ一致への加算値(final_score = similarity + BOOST)。確定値0.005(2026-07-31決裁・
+// 定数vs相対式k×pool_spreadの7クエリベンチで決定: top12集合は全ケース同一、相対式はspreadが
+// 外れ値駆動のため広プールで二分割閾値を超えるリスクがあり定数を採用)。
+// 基準0: softフィルタはタイブレークであり順位改変機構ではない — similarity差がBOOST以内の
+// 近接駅間でのみデータ確認済みの駅を優先し、それを超える差は覆さず、いかなる場合も除外しない。
+// 制約: BOOSTが「プール内の max(sim of false) − min(sim of true)」(実測0.0115〜0.0154)を超えると
+// 事実上の二分割に戻りデータ欠損県が常に沈む。
 const SOFT_FILTER_BOOST = 0.005;
 
 // ---- ハザード意図辞書(複合展開) ----
@@ -2177,7 +2185,9 @@ async function stationSearchPayload(env, a) {
   const q = (a.q || '').trim();
   if (!q) return { error: 'Provide q — describe the station/area you want, e.g. "朝ラーメンが食べられて車椅子トイレがある駅" / "terminal with late-night ramen".', attribution: STATION_ATTR };
   if (!env.AI || !env.VECTORIZE_STATION) return { error: 'Station search is not available on this deployment.', attribution: STATION_ATTR };
-  const cap = Math.min(Math.max(Number.parseInt(a.limit, 10) || 10, 1), 20);
+  // name_containsモードはgetByIds経路(Vectorize topK20制約なし)なのでlimit上限300(=候補上限CAND_CAPと同値・全件返却可能)。通常モードは20。
+  const capMax = (a.name_contains || '').trim() ? 300 : 20;
+  const cap = Math.min(Math.max(Number.parseInt(a.limit, 10) || 10, 1), capMax);
   // explicit filters (params) — these always survive the blend fallback
   const explicitFilter = {};
   if (a.pref) {
@@ -2254,16 +2264,76 @@ async function stationSearchPayload(env, a) {
       ...(md.lat ? { lat: md.lat, lng: md.lng } : {}),
     };
   };
+  // ---- name_contains: 駅名部分一致モード(P2-a) ----
+  // Vectorize metadataは部分一致検索できない → station:names表(9,035件)で候補idを確定し、
+  // getByIdsでベクトル+metadataを取ってqでランキング。役割分担: name_contains=絞り込み / q=ランキング。
+  const nameContains = (a.name_contains || '').trim();
+  let rawMatches = null;
+  let nameMatchesTotal = null;
+  let nameTruncNote = null;
+  if (nameContains) {
+    const tbl = await env.TOILET_KV.get('station:names', 'json');
+    if (!tbl) return { error: 'Station name table is not seeded on this deployment.', attribution: STATION_ATTR };
+    const ncNorm = nameContains.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+    let cand = tbl.filter((s) =>
+      (s.nj && s.nj.includes(nameContains)) ||
+      (ncNorm && s.n && s.n.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '').includes(ncNorm)));
+    if (filter.pref) cand = cand.filter((s) => s.pref === filter.pref);
+    nameMatchesTotal = cand.length;
+    filter.name_contains = nameContains; // applied_filtersへの反映(表示用)
+    if (!cand.length) {
+      const meta0 = await env.TOILET_KV.get('ramen:meta', 'json').catch(() => null);
+      return {
+        query: q, count: 0, applied_filters: filter, name_matches_total: 0, stations: [],
+        note: `No station name contains "${nameContains}"${filter.pref ? ` in ${filter.pref}` : ''}.`,
+        notes: STATION_SEARCH_NOTES, ...(meta0 && meta0.data_as_of ? { stats_as_of: meta0.data_as_of } : {}),
+        disclaimer: HAZARD_DISCLAIMER, attribution: STATION_ATTR,
+      };
+    }
+    const CAND_CAP = 300; // getByIdsは20id/回上限 → 15サブリクエスト。超過分はid順で切る(切った事実はnoteで明示=無言の切り捨て禁止)
+    if (cand.length > CAND_CAP) {
+      nameTruncNote = `name_contains matched ${cand.length} stations; ranked within the first ${CAND_CAP} (by station_id). Narrow with pref or a longer substring for exhaustive coverage.`;
+      cand = cand.slice(0, CAND_CAP);
+    }
+    const vecs = [];
+    for (let i = 0; i < cand.length; i += 20) {
+      const got = await env.VECTORIZE_STATION.getByIds(cand.slice(i, i + 20).map((s) => s.id));
+      for (const g of got || []) vecs.push(g);
+    }
+    const qn = Math.sqrt(vector.reduce((s2, x) => s2 + x * x, 0));
+    const cos = (v) => {
+      let dot = 0, n2 = 0;
+      for (let i = 0; i < v.length; i++) { dot += v[i] * vector[i]; n2 += v[i] * v[i]; }
+      return n2 ? dot / (qn * Math.sqrt(n2)) : 0;
+    };
+    // 残りのhardフィルタ(ハザード/ラーメン等)をmetadata上で同義評価
+    const mdMatch = (md) => Object.entries(filter).every(([k, cond]) => {
+      if (k === 'pref' || k === 'name_contains') return true; // 適用済み
+      const v = md[k];
+      if (cond && typeof cond === 'object') {
+        if ('$lte' in cond && !(Number(v ?? 0) <= cond.$lte)) return false;
+        if ('$gte' in cond && !(Number(v ?? 0) >= cond.$gte)) return false;
+        return true;
+      }
+      return Boolean(v ?? false) === Boolean(cond);
+    });
+    rawMatches = vecs
+      .filter((g) => mdMatch(g.metadata || {}))
+      .map((g) => ({ id: g.id, score: cos(g.values), metadata: g.metadata }))
+      .sort((x, y) => y.score - x.score);
+  }
   // softフィルタあり: プールを最大まで取り、スコア加算で緩やかにブースト。
   // 二分割(soft_matchedを第1ソートキー)にすると「他県が消える」が「他県が沈む」に変わるだけなので禁止 —
   // final_score = similarity + SOFT_FILTER_BOOST × (全soft条件一致 ? 1 : 0) の単一キー降順。
   // BOOSTはプール内のsimilarity幅(bge-m3で約0.02)より小さい同帯タイブレーク値であること。
-  const topK = softFilters.length ? 20 : cap; // 20 = Vectorize returnMetadata:'all' の上限
-  const res = await env.VECTORIZE_STATION.query(vector, {
-    topK, returnValues: false, returnMetadata: 'all',
-    ...(Object.keys(filter).length ? { filter } : {}),
-  });
-  const rawMatches = res && res.matches ? res.matches : [];
+  if (rawMatches === null) {
+    const topK = softFilters.length ? 20 : cap; // 20 = Vectorize returnMetadata:'all' の上限
+    const res = await env.VECTORIZE_STATION.query(vector, {
+      topK, returnValues: false, returnMetadata: 'all',
+      ...(Object.keys(filter).length ? { filter } : {}),
+    });
+    rawMatches = res && res.matches ? res.matches : [];
+  }
   let stations;
   if (softFilters.length) {
     const softOK = (m) => softFilters.every((sf) => sf.test(m.metadata || {}));
@@ -2280,7 +2350,8 @@ async function stationSearchPayload(env, a) {
     stations = rawMatches.slice(0, cap).map(toStation);
   }
   // blend fallback: a wrong INFERRED filter may narrow results but must never empty them.
-  if (inferred.length && stations.length < cap) {
+  // name_containsモードでは無効(緩和クエリは名前条件を持たず、非該当駅が混入するため)。
+  if (!nameContains && inferred.length && stations.length < cap) {
     const resB = await env.VECTORIZE_STATION.query(vector, {
       topK: cap, returnValues: false, returnMetadata: 'all',
       ...(Object.keys(explicitFilter).length ? { filter: explicitFilter } : {}),
@@ -2293,9 +2364,11 @@ async function stationSearchPayload(env, a) {
   }
   const meta = await env.TOILET_KV.get('ramen:meta', 'json').catch(() => null);
   const explicitCount = Object.keys(explicitFilter).length;
+  const noteParts = [tasteNote, nameTruncNote].filter(Boolean);
   return {
     query: q, count: stations.length,
     applied_filters: filter,
+    ...(nameMatchesTotal !== null ? { name_matches_total: nameMatchesTotal } : {}),
     ...(softFilters.length ? {
       soft_filters: softFilters.map((sf) => ({
         filter: sf.filter,
@@ -2305,7 +2378,7 @@ async function stationSearchPayload(env, a) {
     } : {}),
     filter_source: inferred.length && explicitCount ? 'explicit+inferred' : inferred.length ? 'inferred' : explicitCount ? 'explicit' : 'none',
     stations,
-    ...(tasteNote ? { note: tasteNote } : {}),
+    ...(noteParts.length ? { note: noteParts.join(' ') } : {}),
     notes: STATION_SEARCH_NOTES,
     ...(meta && meta.data_as_of ? { stats_as_of: meta.data_as_of } : {}),
     disclaimer: HAZARD_DISCLAIMER,
