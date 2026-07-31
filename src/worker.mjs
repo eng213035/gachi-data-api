@@ -70,9 +70,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'station-search-quality-v2',
-  built: '2026-07-31T14:30:00Z',
-  build: 'station_search quality fixes: (1) water-hazard intent expands to flood_rank AND storm_surge=false (new Vectorize metadata index; 液状化/地盤 intent filters liq_level; results carry risk_notes for high official hazard categories outside the filter); (2) inferred facility filters (diaper/accessible toilet — Tokyo-only coverage) are now SOFT: boost confirmed, demote unknown instead of excluding, reported in soft_filters; (3) taste/quality words honestly declared not-evaluated via note; (4) bare trailing pref names (「〜駅 埼玉」) now infer pref. Prior deploy: ramen-dedup-aliases-v1.',
+  commit: 'station-search-softboost-v1',
+  built: '2026-07-31T16:00:00Z',
+  build: 'station_search soft-filter fix: soft_matched partition replaced by score-add ranking — final_score = similarity + SOFT_FILTER_BOOST(0.005 provisional) for stations matching all inferred soft (facility) filters, single-key sort, final_score in response, soft_filters[].mode wording aligned with implementation. Boost stays below the pool similarity spread so unknown-coverage prefectures can still outrank on similarity. Prior deploy: station-search-quality-v2.',
   pricing_tiers: 5,
 };
 
@@ -451,6 +451,7 @@ const TOOLS = [
         status: { type: 'string', description: "Optional: active (default) / closed_confirmed / all." },
         richness: { type: 'string', description: 'Optional broth-richness filter from official-site enrichment: assari / kotteri / futsu / menu_varies. Auto-inferred from the query text (あっさり/こってり…) when omitted.' },
         hours: { type: 'string', description: 'Optional hours filter: morning / late_night / 24h. Auto-inferred from the query text (朝/深夜/24時間…) when omitted.' },
+        spice: { type: 'string', description: 'Optional spiciness filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Auto-inferred from the query text (辛い/激辛/オロチョン/spicy…, negations like 辛くない do not trigger). tantanmen alone never implies spicy.' },
       },
       required: ['q'],
     },
@@ -542,7 +543,7 @@ const TOOL_OUTPUT_SCHEMAS = {
   station_search: openObj({
     query: s('Echo of the query.'), count: s('Results returned.'),
     applied_filters: obj('Hard metadata filters actually applied (explicit + inferred).'),
-    soft_filters: arr('Inferred facility filters applied as BOOST (confirmed first, unknown demoted — not excluded), with coverage note. Present only when active.'),
+    soft_filters: arr('Inferred facility filters applied as a score BOOST (confirmed stations get +BOOST on similarity = final_score; unknown/missing never excluded), with coverage note. Present only when active.'),
     filter_source: s('explicit / inferred / none — how the filters were chosen.'),
     stations: arr('Matching stations, best first: name, pref, similarity, ramen stats, toilet stats, official hazard categories (plus risk_notes when an official hazard category not covered by the filter is high), lines, ridership.'),
     note: s('Present when the query contains taste/quality words: they are not evaluated (no review data).'),
@@ -1541,6 +1542,7 @@ async function handleRpc(body, env, opts = {}) {
         limit: a.limit,
         richness: (a.richness || '').trim() || null,
         hours: (a.hours || '').trim() || null,
+        spice: (a.spice || '').trim() || null,
       });
       withRamenDataAsOf(payload, await ramenDataAsOf(env));
       return mcpResult(id, payload);
@@ -1725,6 +1727,8 @@ const RAMEN_DEFS = {
     'a closed_candidate found open on web verification (high confidence, no successor record within 200 m) is restored to active',
   merged:
     'this id was consolidated into merged_into (duplicate-record dedup 2026-07-31). Old ids stay resolvable: get_ramen_shop / GET /v1/shops/{old_id} return the canonical record with merged_into set',
+  spice_level:
+    'spicy = spiciness is the shop\'s signature (chain official signage or shop-name signal, dual-LLM verified; no UGC) | null = unknown (never guessed). Independent of keito: tantanmen alone never implies spicy',
   midnight_hours: 'true = open at/after 23:00; null = unknown (never coerced to false)',
   keito: '19-value ramen-style vocabulary assigned by our classifier (incl. regional schools champon/toripaitan/asahikawa etc.); [] = unclassified (we do not guess)',
   data_as_of: 'Dataset build date (response-level). Active shops are present in the source as of this date — a DATASET-level freshness signal, not an independent per-shop re-verification.',
@@ -1925,6 +1929,11 @@ const VIBE_HOURS_INTENT = [
   [/朝ラー|朝から|早朝|モーニング|morning|breakfast/i, 'morning'],
   [/24時間|24h|24 hours/i, '24h'],
 ];
+// spice intent (2026-07-31 spice_level軸新設): 辛さ語彙 -> spice=spicy filter。
+// 否定形(辛くない/控えめ/苦手)では発火しない。「担々麺/tantanmen」は意図的に不発火
+// (汁なし白胡麻系など辛くない店があるため。spice_levelはkeitoと独立の裁定)。
+const VIBE_SPICE_NEG = /辛くない|辛さ控えめ|辛さ抑えめ|辛いの(?:苦手|だめ|ダメ)|not spicy|mild/i;
+const VIBE_SPICE_INTENT = /激辛|辛い|辛め|辛口|オロチョン|カラシビ|麻辣|マーラー|spicy|\bhot\b/i;
 // Indirect scenario words (season / body condition) -> concrete corpus vocabulary.
 // The vector corpus is built from taxonomy phrases (vibe/keito_map.py), so queries like
 // 「汗だくの夏に塩分補給」 share zero tokens with any shop sentence. When a scenario fires we
@@ -1977,7 +1986,7 @@ function vibeInferPref(q) {
 }
 
 
-async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, hours }) {
+async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, hours, spice }) {
   if (!q) return { error: 'Provide q — a natural-language description, e.g. "rich creamy pork bone broth" / "あっさり淡麗な醤油".', attribution: RAMEN_ATTR };
   if (!env.AI || !env.VECTORIZE) return { error: 'Semantic search is not available on this deployment.', attribution: RAMEN_ATTR };
   const cap = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 20);
@@ -2002,11 +2011,14 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
   const HOURS_VALUES = ['morning', 'late_night', '24h'];
   let rich = (richness || '').toLowerCase() || null;
   let hrs = (hours || '').toLowerCase() || null;
+  let spc = (spice || '').toLowerCase() || null;
   if (rich && !RICH_VALUES.includes(rich)) return { error: `richness must be one of ${RICH_VALUES.join('/')}.`, attribution: RAMEN_ATTR };
   if (hrs && !HOURS_VALUES.includes(hrs)) return { error: `hours must be one of ${HOURS_VALUES.join('/')}.`, attribution: RAMEN_ATTR };
-  const explicit = Boolean(rich || hrs);
+  if (spc && spc !== 'spicy') return { error: 'spice must be "spicy" (the only filterable value — none/unknown are not filter targets).', attribution: RAMEN_ATTR };
+  const explicit = Boolean(rich || hrs || spc);
   if (!rich) { for (const [rx, v] of VIBE_RICH_INTENT) if (rx.test(q)) { rich = v; break; } }
   if (!hrs) { for (const [rx, v] of VIBE_HOURS_INTENT) if (rx.test(q)) { hrs = v; break; } }
+  if (!spc && VIBE_SPICE_INTENT.test(q) && !VIBE_SPICE_NEG.test(q)) spc = 'spicy';
   let embedText = String(q).slice(0, 300);
   let sceneTerms = null;
   for (const [rx, terms, d] of VIBE_SCENE_EXPAND) {
@@ -2021,6 +2033,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
   const attrFilter = {};
   if (rich) attrFilter.richness = rich;
   if (hrs) attrFilter.hours = hrs;
+  if (spc) attrFilter.spice = spc;
   let vector;
   try {
     const emb = await env.AI.run('@cf/baai/bge-m3', { text: [embedText] });
@@ -2035,6 +2048,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       keito: md.keito ? String(md.keito).split(',') : [],
       ...(md.richness ? { richness: md.richness } : {}),
       ...(md.hours ? { hours_class: String(md.hours).split(',') } : {}),
+      ...(md.spice ? { spice_level: md.spice } : {}),
       status: md.status || 'active',
       ...(attrMatched != null ? { attr_matched: attrMatched } : {}),
       similarity: Math.round(m.score * 10000) / 10000,
@@ -2088,6 +2102,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
              ...(filter.pref ? { pref_source: explicitPref ? 'param' : 'inferred' } : {}),
              ...(sceneTerms ? { scene_expansion: sceneTerms } : {}),
              ...(rich ? { richness: rich } : {}), ...(hrs ? { hours: hrs } : {}),
+             ...(spc ? { spice: spc } : {}),
              ...(Object.keys(attrFilter).length ? { attr_filter_source: explicit ? 'param' : 'inferred' } : {}) },
     count: shops.length, shops,
     note: 'Semantic matches, best first (lite shape + similarity 0–1). Use get_ramen_shop / GET /v1/shops/{id} for the full record; use search_ramen for exact name/keito/geo filters.',
@@ -2134,6 +2149,13 @@ function stationInferPref(q) {
 
 // 品質・味の語は評価しない(レビューデータ無し)ことの正直な宣言に使う検知。
 const STATION_TASTE_WORDS = /うまい|旨い|美味い|美味しい|おいしい|絶品|名店|delicious|tasty|good\s+(food|ramen|eats)|best\s+(food|ramen)/i;
+
+// softフィルタ一致への加算値(final_score = similarity + BOOST)。暫定値0.005(2026-07-31決裁・
+// 確定値は定数vs相対式(k×pool_spread)ベンチ後に再決裁)。
+// 制約: BOOSTが「プール内の max(sim of false) − min(sim of true)」を超えると事実上の二分割に戻り
+// データ欠損県が常に沈む(P0検証クエリでは閾値0.0115)。bge-m3のtop20プールsim幅は~0.02なので、
+// その1/4程度=同帯タイブレークに留める。
+const SOFT_FILTER_BOOST = 0.005;
 
 // ---- ハザード意図辞書(複合展開) ----
 // 低リスク方向の言い回し: ない/なし/低い/避けたい/安心/安全/少ない/心配(がない)/不安/〜に強い 等。
@@ -2232,22 +2254,31 @@ async function stationSearchPayload(env, a) {
       ...(md.lat ? { lat: md.lat, lng: md.lng } : {}),
     };
   };
-  // softフィルタあり: プールを最大まで取り、確認済み駅を先頭にブースト(similarity順は各層内で維持)。
+  // softフィルタあり: プールを最大まで取り、スコア加算で緩やかにブースト。
+  // 二分割(soft_matchedを第1ソートキー)にすると「他県が消える」が「他県が沈む」に変わるだけなので禁止 —
+  // final_score = similarity + SOFT_FILTER_BOOST × (全soft条件一致 ? 1 : 0) の単一キー降順。
+  // BOOSTはプール内のsimilarity幅(bge-m3で約0.02)より小さい同帯タイブレーク値であること。
   const topK = softFilters.length ? 20 : cap; // 20 = Vectorize returnMetadata:'all' の上限
   const res = await env.VECTORIZE_STATION.query(vector, {
     topK, returnValues: false, returnMetadata: 'all',
     ...(Object.keys(filter).length ? { filter } : {}),
   });
-  let matches = res && res.matches ? res.matches : [];
+  const rawMatches = res && res.matches ? res.matches : [];
+  let stations;
   if (softFilters.length) {
     const softOK = (m) => softFilters.every((sf) => sf.test(m.metadata || {}));
-    matches = [...matches.filter(softOK), ...matches.filter((m) => !softOK(m))];
+    stations = rawMatches
+      .map((m) => ({ m, ok: softOK(m), final: m.score + (softOK(m) ? SOFT_FILTER_BOOST : 0) }))
+      .sort((x, y) => y.final - x.final)
+      .slice(0, cap)
+      .map(({ m, ok, final }) => ({
+        ...toStation(m),
+        soft_matched: ok,
+        final_score: Math.round(final * 10000) / 10000,
+      }));
+  } else {
+    stations = rawMatches.slice(0, cap).map(toStation);
   }
-  let stations = matches.slice(0, cap).map((m) => {
-    const s = toStation(m);
-    if (softFilters.length) s.soft_matched = softFilters.every((sf) => sf.test(m.metadata || {}));
-    return s;
-  });
   // blend fallback: a wrong INFERRED filter may narrow results but must never empty them.
   if (inferred.length && stations.length < cap) {
     const resB = await env.VECTORIZE_STATION.query(vector, {
@@ -2268,7 +2299,7 @@ async function stationSearchPayload(env, a) {
     ...(softFilters.length ? {
       soft_filters: softFilters.map((sf) => ({
         filter: sf.filter,
-        mode: 'boost — confirmed stations ranked first; unknown/missing data demoted, not excluded',
+        mode: `boost — confirmed stations get +${SOFT_FILTER_BOOST} added to similarity (final_score); unknown/missing data is never excluded and can still outrank on similarity`,
         coverage: sf.coverage,
       })),
     } : {}),
