@@ -70,9 +70,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'toilet-dedup-romaji-namecontains-v1',
-  built: '2026-07-31T18:30:00Z',
-  build: 'P1-P3 batch: (P1) toilet dedup — 12 duplicate records removed (full-field-equality key, photos merged), station keys normalized (渋谷駅→渋谷 = +1 Ginza-line toilet now visible, 羽田空港第３→第3 zen/hankaku unified, 練馬駅/木場駅/虎ノ門ヒルズ駅/新大久保駅 → base names; 526→524 station keys, 782→770 toilet records); (P2-b) romaji lookup for 291 non-ODPT stations from audited Station Master names (eng:/romaji: KV, station_name_source=romaji_generated, macron-folded normalization) — japanese_fallback 293→0; (P2-a) station_search name_contains substring filter (station:names table + getByIds ranking + name_matches_total); (P3-a) gate/gate_ja restored by parsing 改札内/外 from toilet names + gate_status column (12 records); soft-filter BOOST finalized at 0.005 (7-query constant-vs-relative bench; relative rejected — spread is outlier-driven). Prior deploy: spice-level-v1.',
+  commit: 'spice-filter-exposure-v1',
+  built: '2026-07-31T20:30:00Z',
+  build: 'P2-1,2 (2026-07-31 instruction #2): spice_level exposed as an explicit filter — search_ramen gains spice_level param (spicy/unknown; works on pref/city, nearby and nationwide paths; lite/geo indexes now carry spice_level for the 357 spicy shops), vibe_search gains spice_level as the canonical param name (spice kept as deprecated alias; explicit wins over query-text inference). keito(lineage) vs spice_level(attribute) orthogonality documented in both schemas. Prior deploy: toilet-dedup-romaji-namecontains-v1.',
   pricing_tiers: 5,
 };
 
@@ -390,6 +390,7 @@ const TOOLS = [
         city: { type: 'string', description: 'Municipality, Japanese (松戸市, 世田谷区) OR romaji (kawaguchi, setagaya). Works alone — prefecture is auto-resolved (add pref if the romaji is ambiguous).' },
         keito: { type: 'string', description: 'Optional ramen-style filter. Coarse bucket (tonkotsu, miso, shoyu, shio, tsukemen, spicy, other) matches every school in the bucket — tonkotsu also covers iekei/家系 & jiro/二郎. Or an exact fine value from the 19-value vocabulary: iekei, jiro, tsukemen, tantanmen, abura_mazesoba, chuka_tanrei, champon, toripaitan, sapporo, asahikawa, kitakata_aizu, shirakawa, sano, onomichi… (keito=champon returns only champon shops). ~23% of shops carry a style; the rest are unclassified.' },
         status: { type: 'string', description: 'Optional: active (default: all) / closed_candidate / closed_confirmed.' },
+        spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (357 shops whose signature is spiciness — dual-verified, never guessed) or "unknown" (no spice data). Orthogonal to keito: keito is the style lineage, spice_level is an attribute — keito=spicy (coarse bucket, effectively tantanmen) does NOT mean the shop is spicy.' },
         chain: { type: 'string', description: 'Optional chain filter on the curated chain label (e.g. chain=ラーメンショップ matches the whole family incl. ラーショ/うまいラーメンショップ variants; also 山岡家, 一蘭, 天下一品…). Works nationwide alone or combined with pref/city/nearby. Unlike q, this is curated membership, not a name substring.' },
         chain_sub: { type: 'string', description: 'Optional sub-lineage within a chain (currently for chain=ラーメンショップ): tsubaki (椿系), aji_q (アジキュー系), new_rasho (ニュー系), satsumakko (さつまっ子系), 105, kaizan (かいざん系). Exact value match; combine with chain or use alone.' },
         q: { type: 'string', description: 'Shop-name substring, Japanese OR romaji/English (e.g. 一蘭 or ichiran, 豚坂下 or butasakashita). Works NATIONWIDE on its own — pass q with no pref/city to check if a shop exists anywhere.' },
@@ -453,7 +454,8 @@ const TOOLS = [
         status: { type: 'string', description: "Optional: active (default) / closed_confirmed / all." },
         richness: { type: 'string', description: 'Optional broth-richness filter from official-site enrichment: assari / kotteri / futsu / menu_varies. Auto-inferred from the query text (あっさり/こってり…) when omitted.' },
         hours: { type: 'string', description: 'Optional hours filter: morning / late_night / 24h. Auto-inferred from the query text (朝/深夜/24時間…) when omitted.' },
-        spice: { type: 'string', description: 'Optional spiciness filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Auto-inferred from the query text (辛い/激辛/オロチョン/spicy…, negations like 辛くない do not trigger). tantanmen alone never implies spicy.' },
+        spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Explicit value wins over query-text inference (辛い/激辛/オロチョン/spicy…; negations like 辛くない do not trigger). Orthogonal to keito: keito is style lineage, spice_level is an attribute — tantanmen alone never implies spicy.' },
+        spice: { type: 'string', description: 'Deprecated alias of spice_level (kept for backward compatibility).' },
       },
       required: ['q'],
     },
@@ -1506,6 +1508,7 @@ async function handleRpc(body, env, opts = {}) {
         q: (a.q || '').trim() || null,
         chain: (a.chain || '').trim() || null,
         chainSub: (a.chain_sub || '').trim() || null,
+        spiceLevel: (a.spice_level || '').trim().toLowerCase() || null,
         match: (a.match || '').trim() || null,
         lat: typeof a.lat === 'number' ? a.lat : parseFloat(a.lat),
         lng: typeof a.lng === 'number' ? a.lng : parseFloat(a.lng),
@@ -1548,7 +1551,7 @@ async function handleRpc(body, env, opts = {}) {
         limit: a.limit,
         richness: (a.richness || '').trim() || null,
         hours: (a.hours || '').trim() || null,
-        spice: (a.spice || '').trim() || null,
+        spice: ((a.spice_level || a.spice) || '').trim() || null,  // spice_level=正式名 / spice=旧名(後方互換)
       });
       withRamenDataAsOf(payload, await ramenDataAsOf(env));
       return mcpResult(id, payload);
@@ -1845,7 +1848,12 @@ async function ramenResolvePrefFromCity(env, city) {
   return { pref: prefs[0], city: key };
 }
 
-async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng, radius, limit, match, chain, chainSub, maxLimit = 50, maxRadius = 5000 }) {
+async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng, radius, limit, match, chain, chainSub, spiceLevel, maxLimit = 50, maxRadius = 5000 }) {
+  // spice_level(属性軸)フィルタ。spicy=看板が辛さ(裁定済357店) / unknown=データなし。keito(系統)とは独立。
+  if (spiceLevel && !['spicy', 'unknown'].includes(spiceLevel)) {
+    return { error: 'spice_level must be "spicy" or "unknown".', attribution: RAMEN_ATTR };
+  }
+  const spiceMatch = (s) => (spiceLevel === 'spicy' ? s.spice_level === 'spicy' : !s.spice_level);
   // No-auth callers pass a lower maxLimit/maxRadius; over-limit requests are CLAMPED, not rejected.
   const cap = Math.min(Math.max(Number.parseInt(limit, 10) || Math.min(20, maxLimit), 1), maxLimit);
   const exact = (match || '').toLowerCase() === 'exact';  // opt-in whole-word q match
@@ -1870,9 +1878,10 @@ async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng,
     if (chainSub) out = out.filter((s) => (s.chain_sub || '').toLowerCase() === chainSub.toLowerCase());
     if (status) out = out.filter((s) => (s.status || 'active') === status);
     if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
+    if (spiceLevel) out = out.filter(spiceMatch);
     out.sort((a, b) => a.distance_m - b.distance_m);
     return {
-      query: { lat, lng, radius_m: rad, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null },
+      query: { lat, lng, radius_m: rad, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null, ...(spiceLevel ? { spice_level: spiceLevel } : {}) },
       count: Math.min(out.length, cap), total_matched: out.length, shops: out.slice(0, cap).map((s) => ({ ...s, keito: s.keito || [] })),
       note: 'Nearby results are the lite shape (id/name/pref/city/coords/keito/status). Use get_ramen_shop / GET /v1/shops/{id} for the full record.',
       attribution: RAMEN_ATTR,
@@ -1889,8 +1898,9 @@ async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng,
       if (chainSub) out = out.filter((s) => (s.chain_sub || '').toLowerCase() === chainSub.toLowerCase());
       if (status) out = out.filter((s) => (s.status || 'active') === status);
       if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
+      if (spiceLevel) out = out.filter(spiceMatch);
       return {
-        query: { q: q || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, scope: 'nationwide' },
+        query: { q: q || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, ...(spiceLevel ? { spice_level: spiceLevel } : {}), scope: 'nationwide' },
         count: Math.min(out.length, cap), total_matched: out.length, shops: out.slice(0, cap).map((s) => ({ ...s, keito: s.keito || [] })),
         note: 'Nationwide search (lite shape: id/name/name_en/pref/city/status). Use get_ramen_shop / GET /v1/shops/{id} for the full record.',
         attribution: RAMEN_ATTR,
@@ -1910,9 +1920,10 @@ async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng,
     const meta = await env.TOILET_KV.get('ramen:meta', 'json');
     return { error: `No data for pref "${pref}". Use the full form (東京都, 大阪府, 北海道, 千葉県…).`, prefs: meta?.prefs || [], attribution: RAMEN_ATTR };
   }
-  const matched = ramenFilterFull(arr, { city, keito, status, q, exact, chain, chainSub });
+  let matched = ramenFilterFull(arr, { city, keito, status, q, exact, chain, chainSub });
+  if (spiceLevel) matched = matched.filter(spiceMatch);
   return {
-    query: { pref, city: city || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null },
+    query: { pref, city: city || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null, ...(spiceLevel ? { spice_level: spiceLevel } : {}) },
     count: Math.min(matched.length, cap), total_matched: matched.length, shops: matched.slice(0, cap).map(ramenPublicShape),
     definitions: RAMEN_DEFS, attribution: RAMEN_ATTR,
   };
@@ -2996,6 +3007,7 @@ export default {
         q: (url.searchParams.get('q') || '').trim() || null,
         chain: (url.searchParams.get('chain') || '').trim() || null,
         chainSub: (url.searchParams.get('chain_sub') || '').trim() || null,
+        spiceLevel: (url.searchParams.get('spice_level') || '').trim().toLowerCase() || null,
         match: (url.searchParams.get('match') || '').trim() || null,
         lat, lng, radius: url.searchParams.get('radius'), limit: url.searchParams.get('limit'),
         // No-auth: all 47 prefectures, but limit capped 20 and nearby radius capped 2,000 m (clamped).
