@@ -3,37 +3,195 @@
 // - Per-plan monthly rate limiting (KV counter; eventually consistent = approximate, fine for MVP)
 // - English landing page + free-key form + Business interest form
 // Data served straight from KV (see build_kv_seed*.py). No D1/Stripe-webhook in this lean build.
+//
+// Host branching: this one Worker answers two custom domains.
+//   api.gachi-tokusuru.com   — the full Gachi Data API (all 11 tools, own landing page).
+//   ramen.gachi-tokusuru.com — the standalone "Japan Ramen Active Master" product: serves the
+//                              ramen LP at /, and /mcp exposes ONLY the 3 ramen tools. REST /v1/shops
+//                              and /keys /interest are shared infra (same KV, same key issuance).
+import { RAMEN_LP_HTML } from './ramen_lp.mjs';
+import { RAMEN_STORY_HTML } from './ramen_story.mjs';
+import { RAMEN_SAMPLE } from './ramen_sample.mjs';
+
+const RAMEN_HOST = 'ramen.gachi-tokusuru.com';
+const RAMEN_TOOL_NAMES = new Set(['search_ramen', 'get_ramen_shop', 'get_ramen_changes', 'vibe_search']);
+
+// api.* MCP surface is fully public (no key required): every tool is read-only and returns ONLY
+// published open data / official-relay facts, one record at a time (no bulk extraction), so there is
+// no data reason to gate calls. A no-key client sees all tools in tools/list and may call any of
+// them, IP rate-limited by NOAUTH_LIMITER. Keys still exist for REST, higher metered volume, and the
+// standalone ramen product (ramen.* stays key-gated). Ramen tools are excluded from the api.* surface.
+
+// keito OUTPUT is the fine 19-value vocabulary as stored (champon/toripaitan/asahikawa… — 2026-07-21
+// taxonomy adoption: regional schools are the product's value, expose them). KEITO_COARSE remains as
+// the FILTER convenience layer: filtering by a coarse bucket (tonkotsu/miso/shoyu/shio/tsukemen/spicy/
+// other) matches every fine school in that bucket, e.g. keito=tonkotsu also returns iekei/jiro shops.
+const KEITO_COARSE = {
+  tonkotsu: 'tonkotsu', iekei: 'tonkotsu', yokohama_iekei: 'tonkotsu', jiro: 'tonkotsu',
+  miso: 'miso', sapporo: 'miso',
+  shoyu: 'shoyu', chuka_tanrei: 'shoyu', kitakata: 'shoyu', kitakata_aizu: 'shoyu', niboshi: 'shoyu',
+  asahikawa: 'shoyu', shirakawa: 'shoyu', sano: 'shoyu', onomichi: 'shoyu',
+  shio: 'shio',
+  tsukemen: 'tsukemen',
+  tantanmen: 'spicy',
+  abura_mazesoba: 'other', mazesoba: 'other', ramen_shop: 'other', curry: 'other', other: 'other',
+  toripaitan: 'other', champon: 'other',
+};
+function ramenCoarseKeito(arr) {
+  const out = [];
+  for (const k of (arr || [])) {
+    const c = KEITO_COARSE[k] || 'other';
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+// keito filter: a coarse bucket value → bucket match (keito=tonkotsu also returns iekei/jiro shops,
+// unchanged behavior); a fine value → EXACT fine match (keito=champon returns only champon shops,
+// not the whole 'other' bucket).
+const KEITO_COARSE_BUCKETS = new Set(['tonkotsu', 'miso', 'shoyu', 'shio', 'tsukemen', 'spicy', 'other']);
+function ramenKeitoMatch(shopKeito, q) {
+  if (KEITO_COARSE_BUCKETS.has(q)) return ramenCoarseKeito(shopKeito).includes(q);
+  return (shopKeito || []).includes(q);
+}
+
+// Romaji prefecture name -> Japanese, so pref=saitama / tokyo / osaka work (English-first).
+const PREF_EN_REV = {
+  hokkaido: '北海道', aomori: '青森県', iwate: '岩手県', miyagi: '宮城県', akita: '秋田県',
+  yamagata: '山形県', fukushima: '福島県', ibaraki: '茨城県', tochigi: '栃木県', gunma: '群馬県',
+  saitama: '埼玉県', chiba: '千葉県', tokyo: '東京都', kanagawa: '神奈川県', niigata: '新潟県',
+  toyama: '富山県', ishikawa: '石川県', fukui: '福井県', yamanashi: '山梨県', nagano: '長野県',
+  gifu: '岐阜県', shizuoka: '静岡県', aichi: '愛知県', mie: '三重県', shiga: '滋賀県',
+  kyoto: '京都府', osaka: '大阪府', hyogo: '兵庫県', nara: '奈良県', wakayama: '和歌山県',
+  tottori: '鳥取県', shimane: '島根県', okayama: '岡山県', hiroshima: '広島県', yamaguchi: '山口県',
+  tokushima: '徳島県', kagawa: '香川県', ehime: '愛媛県', kochi: '高知県', fukuoka: '福岡県',
+  saga: '佐賀県', nagasaki: '長崎県', kumamoto: '熊本県', oita: '大分県', miyazaki: '宮崎県',
+  kagoshima: '鹿児島県', okinawa: '沖縄県',
+};
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'mint-rate-limit',
-  built: '2026-07-06T12:40:00Z',
-  build: 'per-ip-daily-cap-on-key-minting',
+  commit: 'station-search-quality-v2',
+  built: '2026-07-31T14:30:00Z',
+  build: 'station_search quality fixes: (1) water-hazard intent expands to flood_rank AND storm_surge=false (new Vectorize metadata index; 液状化/地盤 intent filters liq_level; results carry risk_notes for high official hazard categories outside the filter); (2) inferred facility filters (diaper/accessible toilet — Tokyo-only coverage) are now SOFT: boost confirmed, demote unknown instead of excluding, reported in soft_filters; (3) taste/quality words honestly declared not-evaluated via note; (4) bare trailing pref names (「〜駅 埼玉」) now infer pref. Prior deploy: ramen-dedup-aliases-v1.',
   pricing_tiers: 5,
 };
 
-const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, admin: Infinity };
+// Server icons (served at /icon.svg per host; referenced from initialize serverInfo.icon). Self-contained
+// SVG so there's no external asset dependency — a ramen bowl on ramen.*, a station/data mark on api.*.
+const RAMEN_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Ramen bowl">
+<rect width="512" height="512" rx="96" fill="#b3121b"/>
+<g fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round">
+<path d="M188 150c0-26 20-44 44-44M256 142c0-30 22-50 48-50M322 150c0-24 18-42 40-42"/>
+</g>
+<path d="M104 250h304a24 24 0 0 1-4 14l-40 92a56 56 0 0 1-51 34H199a56 56 0 0 1-51-34l-40-92a24 24 0 0 1-4-14z" fill="#fff"/>
+<path d="M124 268h264l-33 76a40 40 0 0 1-37 25H194a40 40 0 0 1-37-25z" fill="#f4a72b"/>
+<circle cx="212" cy="312" r="26" fill="#fff"/><circle cx="212" cy="312" r="12" fill="#f4a72b"/>
+<path d="M150 300c40 10 90 12 140 4" fill="none" stroke="#c8801a" stroke-width="9" stroke-linecap="round"/>
+<rect x="300" y="150" width="150" height="12" rx="6" transform="rotate(24 375 156)" fill="#7a3b12"/>
+<rect x="300" y="176" width="150" height="12" rx="6" transform="rotate(24 375 182)" fill="#7a3b12"/>
+</svg>`;
+const API_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Japan data">
+<rect width="512" height="512" rx="96" fill="#0b6e4f"/>
+<g fill="#fff">
+<ellipse cx="256" cy="176" rx="118" ry="30" opacity=".95"/>
+<ellipse cx="256" cy="176" rx="118" ry="30" fill="none" stroke="#0b6e4f" stroke-width="0"/>
+<path d="M138 176v72c0 17 53 30 118 30s118-13 118-30v-72c0 17-53 30-118 30s-118-13-118-30z" opacity=".8"/>
+<path d="M138 256v72c0 17 53 30 118 30s118-13 118-30v-72c0 17-53 30-118 30s-118-13-118-30z" opacity=".65"/>
+</g>
+<path d="M256 300c-40 0-72 32-72 72 0 54 72 118 72 118s72-64 72-118c0-40-32-72-72-72z" fill="#fff"/>
+<circle cx="256" cy="372" r="30" fill="#0b6e4f"/>
+</svg>`;
+
+const PLAN_LIMITS = { free: 1000, pro: 100000, all_access: 200000, business: 500000, enterprise: Infinity, ramen_pro: Infinity, admin: Infinity };
+
+// ---- Pricing model -------------------------------------------------------------------------------
+// Two tiers only: Free (nationwide, keyless or Free key, 60 req/min IP + 1,000/mo per key) and Pro
+// (unlimited volume, higher QPS, REST, commercial licence). The former 7-day / 3-prefecture "trial"
+// plan was retired 2026-07-22 — every ramen data surface is nationwide on Free. Legacy gk_trial_
+// keys still in KV are coerced to plan:'free' in resolveAuth so they keep working, never error.
+const RAMEN_UPGRADE_URL = 'https://ramen.gachi-tokusuru.com';
 
 // Paid-plan metadata for key issuance + the activation success page.
 const PLAN_META = {
-  pro:        { prefix: 'gk_pro_', label: 'Pro',        stat: 'stat:pro_keys_issued' },
-  all_access: { prefix: 'gk_all_', label: 'All Access', stat: 'stat:all_access_keys_issued' },
-  business:   { prefix: 'gk_biz_', label: 'Business',   stat: 'stat:business_keys_issued' },
+  pro:        { prefix: 'gk_pro_',  label: 'Pro',        stat: 'stat:pro_keys_issued',        product: 'gachi' },
+  all_access: { prefix: 'gk_all_',  label: 'All Access', stat: 'stat:all_access_keys_issued',  product: 'gachi' },
+  business:   { prefix: 'gk_biz_',  label: 'Business',   stat: 'stat:business_keys_issued',    product: 'gachi' },
+  // Standalone Ramen product: $500/mo, unlimited, scoped to the ramen dataset only.
+  ramen_pro:  { prefix: 'gk_rpro_', label: 'Ramen Pro',  stat: 'stat:ramen_pro_keys_issued',   product: 'ramen' },
 };
-// Plan is detected from the paid amount (USD cents). $19/$49/$149 are distinct,
-// so this is unambiguous without needing Stripe price IDs (the restricted key
-// can't read them). If a future plan reuses an amount, add it here.
-const AMOUNT_TO_PLAN = { 1900: 'pro', 4900: 'all_access', 14900: 'business' };
+// Plan is detected from the paid amount (USD cents). Amounts are distinct, so this is
+// unambiguous without needing Stripe price IDs (the restricted key can't read them).
+// If a future plan reuses an amount, add it here.
+const AMOUNT_TO_PLAN = { 1900: 'pro', 4900: 'all_access', 14900: 'business', 50000: 'ramen_pro' };
 
-// Payment Links (Stripe). Pro is live; All Access / Business are placeholders the
-// operator fills in after creating the links in Stripe (Phase 5 human task).
+// Payment Links (Stripe). Pro / All Access / Business are the general Gachi Data API plans.
+// ramen_pro is the standalone $500/mo Ramen product link (success_url → /activate).
 const PAYMENT_LINKS = {
   pro: 'https://buy.stripe.com/cNi6oHaKhaZp8mJ6Rh3Ru04',
   all_access: 'https://buy.stripe.com/6oU8wP05D2sTdH36Rh3Ru02',
   business: 'https://buy.stripe.com/3cIbJ18C9d7xdH30sT3Ru03',
+  ramen_pro: 'https://buy.stripe.com/aFa9AT2dLebB46t4J93Ru05',
+};
+// Stripe TEST-mode ($500/mo) link for sandbox payment testing. Reached via /subscribe?test=1.
+// Its checkout produces cs_test_* sessions, verified in activate() with STRIPE_SECRET_KEY_TEST (sk_test_*).
+const PAYMENT_LINK_RAMEN_PRO_TEST = 'https://buy.stripe.com/test_3cIfZh6wu6AAh0tfTN57W00';
+
+// ---- ping (connection test / health check) ------------------------------------------------------
+// Shown on BOTH hosts (special-cased in visibleTools). Not a bare pong: it self-proves data freshness.
+// Response + metadata are host-specific (ramen: active-shop count + last crawl date; api: tool count +
+// realtime snapshot update times). Numbers are read live from KV (cheap single gets) so they never rot
+// into a stale hardcoded value. No auth, no args — counted in the normal no-auth rate limit.
+const STATIONS_COVERED = 526; // Tokyo Bureau of Social Welfare accessible-toilet dataset (fixed size).
+const PING_DESC_RAMEN =
+  'Connection test / health check — call this first to confirm the server is reachable. Returns server '
+  + 'identity, deploy version, and live data freshness (active shop count + the latest weekly-crawl date) '
+  + 'so you can confirm the data is current, not just that the server is up. No auth, no arguments, lightweight.';
+const PING_DESC_API =
+  'Connection test / health check — call this first to confirm the server is reachable. Returns server '
+  + 'identity, deploy version, tool count, station coverage, and the update times of the realtime layers '
+  + '(JMA alerts, train status) so you can confirm freshness, not just liveness. No auth, no arguments, lightweight.';
+const pingLeaf = (description) => ({ description });
+const PING_OUTPUT_SCHEMA_RAMEN = {
+  type: 'object', additionalProperties: true,
+  description: 'Health check: server identity + live ramen-data freshness.',
+  properties: {
+    status: pingLeaf('Always "ok" when the server is reachable.'),
+    server: pingLeaf('Server name.'),
+    version: pingLeaf('Deploy version.'),
+    shops_active: pingLeaf('Live count of active ramen shops in the dataset.'),
+    last_weekly_crawl: pingLeaf('Date the dataset was last refreshed (YYYY-MM-DD).'),
+    coverage: pingLeaf('Geographic coverage.'),
+    rate_limit_noauth: pingLeaf('No-auth rate limit.'),
+  },
+};
+const PING_OUTPUT_SCHEMA_API = {
+  type: 'object', additionalProperties: true,
+  description: 'Health check: server identity + realtime-layer freshness.',
+  properties: {
+    status: pingLeaf('Always "ok" when the server is reachable.'),
+    server: pingLeaf('Server name.'),
+    version: pingLeaf('Deploy version.'),
+    tools: pingLeaf('Number of tools exposed by this server.'),
+    stations_covered: pingLeaf('Stations with accessible-toilet data.'),
+    realtime_layers: {
+      type: 'object', additionalProperties: true,
+      description: 'Update times of the realtime KV snapshots (a field is omitted if that layer is unavailable).',
+      properties: {
+        jma_alerts_updated: pingLeaf('When the JMA alerts snapshot was last fetched.'),
+        train_status_updated: pingLeaf('When the train-status snapshot was last fetched.'),
+      },
+    },
+    rate_limit_noauth: pingLeaf('No-auth rate limit.'),
+  },
 };
 
 const TOOLS = [
+  {
+    name: 'ping',
+    description: PING_DESC_API,
+    inputSchema: { type: 'object', properties: {} },
+    outputSchema: PING_OUTPUT_SCHEMA_API,
+  },
   {
     name: 'get_municipality_context',
     description:
@@ -66,9 +224,12 @@ const TOOLS = [
   {
     name: 'get_toilet_by_station',
     description:
-      'Look up wheelchair-accessible / multipurpose toilets inside a Tokyo train station, ' +
+      'Look up wheelchair-accessible / multipurpose toilets inside a train station, ' +
       'including floor, gender, equipment (wheelchair, ostomate, diaper table) and the nearest exit. ' +
-      'Covers 526 Tokyo stations. Accepts Japanese (新宿) or romaji (Shinjuku, Kita-Senju) for major stations.',
+      'Covers 526 Tokyo stations (Tokyo Bureau of Social Welfare data). Major stations outside Tokyo ' +
+      '(Yokohama, Kawasaki, Omiya, Chiba, Fujisawa, Shin-Yokohama…) return an in-station layer that groups ' +
+      'accessible toilets by ticket gate — inside vs outside — per railway operator. ' +
+      'Accepts Japanese (新宿, 横浜) or romaji (Shinjuku, Yokohama) for major stations.',
     prefix: 'toilet:',
     argName: 'station',
     attribution: {
@@ -136,6 +297,41 @@ const TOOLS = [
     },
   },
   {
+    name: 'station_search',
+    description:
+      'Discover Japanese train stations by describing what you want around them, in English or Japanese — ' +
+      '"朝ラーメンが食べられて車椅子トイレがある駅", "terminal station with late-night ramen", "水害リスクが低くてラーメンが多い駅". ' +
+      'Semantic search over 9,035 station profiles (lines/terminal size, ramen density & styles, in-station ' +
+      'accessible-toilet equipment, official hazard categories, ridership) with hybrid metadata filters — ' +
+      'the filters guarantee the constraint, the embedding ranks by fit. Filter intent in the query text ' +
+      '(朝ラー/深夜/おむつ/車椅子/水害リスク低…) is auto-applied (filter_source: inferred); explicit params win. ' +
+      'Water-hazard intent (水害/洪水/浸水/高潮…リスク低) expands to flood rank AND storm-surge zone; 液状化/地盤 intent ' +
+      'filters on the official liquefaction-tendency category; results carry risk_notes when other official hazard ' +
+      'categories are high. Inferred facility filters with partial data coverage (おむつ/車椅子 — Tokyo-only data) ' +
+      'BOOST confirmed stations instead of excluding unknowns (see soft_filters); explicit params remain strict. ' +
+      'Taste/quality words (うまい/delicious…) are not evaluated (no review data); ramen ranking reflects density ' +
+      'and variety only. ' +
+      'Coverage notes: toilet stats = Tokyo stations only; ridership = Greater Tokyo operators only; hazard = ' +
+      'official MLIT categories relayed as-is, NOT a safety judgment. ' +
+      'Role split: station_search finds candidate stations — then get_toilet_by_station / search_ramen / ' +
+      'get_station_hazard / get_station_context for detail on one station.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', description: 'Natural-language description of the station/area you want (ja/en). Concrete attribute words (朝ラー, wheelchair toilet, terminal, 水害リスク低) match best.' },
+        pref: { type: 'string', description: 'Optional prefecture filter, Japanese (東京都, 千葉 OK) or romaji (tokyo/osaka). Auto-inferred from the query text when omitted.' },
+        limit: { type: 'number', description: 'Max results (default 10, max 20).' },
+        morning_ramen: { type: 'boolean', description: 'Require morning-ramen availability nearby (auto-inferred from 朝ラー/morning…).' },
+        late_ramen: { type: 'boolean', description: 'Require late-night ramen nearby (auto-inferred from 深夜/late night…).' },
+        ramen_min: { type: 'number', description: 'Require at least this many ramen shops nearby (e.g. 30).' },
+        accessible_toilet_min: { type: 'number', description: 'Require at least this many in-station accessible toilets (Tokyo stations only; auto-inferred from 車椅子/wheelchair…).' },
+        diaper: { type: 'boolean', description: 'Require a diaper changing table in station toilets (auto-inferred from おむつ/子連れ…).' },
+        flood_rank_max: { type: 'number', description: 'Max official flood inundation-depth rank 0–6 (0 = no assumed inundation; auto-inferred from 水害リスク低/flood-safe…).' },
+      },
+      required: ['q'],
+    },
+  },
+  {
     name: 'get_active_alerts',
     description:
       'Live river flood forecasts and landslide alerts for Japan (JMA official). ' +
@@ -174,7 +370,223 @@ const TOOLS = [
       required: ['query'],
     },
   },
+  {
+    name: 'search_ramen',
+    description:
+      'Search a nationwide Japanese ramen-shop database (62,000+ shops, all 47 prefectures) with a ' +
+      'verifiable freshness layer: monthly source checks, closure candidates, and web-verified closures ' +
+      'with evidence URLs. English-first: shop names and places are searchable in Japanese OR romaji. ' +
+      'To answer "is there a ramen shop called X?", pass q alone — it searches NATIONWIDE by name ' +
+      '(e.g. q=一蘭 or q=ichiran, no prefecture needed). Or filter by prefecture (東京都/大阪府/〇〇県 ' +
+      'or romaji tokyo/osaka/saitama), city (松戸市 or romaji kawaguchi), ramen style (keito), ' +
+      'status (active/closed_candidate/closed_confirmed), or search near a coordinate (lat/lng + radius ' +
+      'up to 5 km). Facts only — no rankings, no reviews. Payment/midnight fields are tri-state (true/false/null=unknown).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pref: { type: 'string', description: 'Prefecture, Japanese (千葉県; short forms 千葉/東京) OR romaji (chiba/tokyo/saitama/osaka). Optional if city, q, or lat/lng is given.' },
+        city: { type: 'string', description: 'Municipality, Japanese (松戸市, 世田谷区) OR romaji (kawaguchi, setagaya). Works alone — prefecture is auto-resolved (add pref if the romaji is ambiguous).' },
+        keito: { type: 'string', description: 'Optional ramen-style filter. Coarse bucket (tonkotsu, miso, shoyu, shio, tsukemen, spicy, other) matches every school in the bucket — tonkotsu also covers iekei/家系 & jiro/二郎. Or an exact fine value from the 19-value vocabulary: iekei, jiro, tsukemen, tantanmen, abura_mazesoba, chuka_tanrei, champon, toripaitan, sapporo, asahikawa, kitakata_aizu, shirakawa, sano, onomichi… (keito=champon returns only champon shops). ~23% of shops carry a style; the rest are unclassified.' },
+        status: { type: 'string', description: 'Optional: active (default: all) / closed_candidate / closed_confirmed.' },
+        chain: { type: 'string', description: 'Optional chain filter on the curated chain label (e.g. chain=ラーメンショップ matches the whole family incl. ラーショ/うまいラーメンショップ variants; also 山岡家, 一蘭, 天下一品…). Works nationwide alone or combined with pref/city/nearby. Unlike q, this is curated membership, not a name substring.' },
+        chain_sub: { type: 'string', description: 'Optional sub-lineage within a chain (currently for chain=ラーメンショップ): tsubaki (椿系), aji_q (アジキュー系), new_rasho (ニュー系), satsumakko (さつまっ子系), 105, kaizan (かいざん系). Exact value match; combine with chain or use alone.' },
+        q: { type: 'string', description: 'Shop-name substring, Japanese OR romaji/English (e.g. 一蘭 or ichiran, 豚坂下 or butasakashita). Works NATIONWIDE on its own — pass q with no pref/city to check if a shop exists anywhere.' },
+        match: { type: 'string', description: "How q matches: 'partial' (default, substring) or 'exact' (whole word on the romaji name — q=ojiya finds 王子家/Ojiya but not 糀谷/Kojiya). Use exact to avoid coincidental substring hits." },
+        lat: { type: 'number', description: 'Optional latitude for nearby search (with lng).' },
+        lng: { type: 'number', description: 'Optional longitude for nearby search (with lat).' },
+        radius_m: { type: 'number', description: 'Nearby search radius in metres (default 1500, max 5000).' },
+        limit: { type: 'number', description: 'Max results (default 20, max 50).' },
+      },
+    },
+  },
+  {
+    name: 'get_ramen_shop',
+    description:
+      'Fetch one ramen shop by its stable id (rk_000001 style) — full record incl. address, coordinates, ' +
+      'ramen style (keito), nearest station (Japan Station Master st_xxxx id + distance), tri-state payment ' +
+      'facts, and the freshness block (first_seen/last_seen/status/closure evidence URL). ' +
+      'No id? Pass name + pref instead and the best match is returned.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Stable shop id, e.g. rk_000851. Preferred.' },
+        name: { type: 'string', description: 'Shop name (Japanese) — used with pref or city when id is unknown.' },
+        pref: { type: 'string', description: 'Prefecture (千葉県; short form 千葉 also OK) — pref or city required with name.' },
+        city: { type: 'string', description: 'Municipality (e.g. 松戸市) — alternative to pref; prefecture auto-resolved.' },
+      },
+    },
+  },
+  {
+    name: 'get_ramen_changes',
+    description:
+      'Monthly change feed for the ramen DB — new shops, closure candidates (missing from the monthly web source ' +
+      '2 consecutive checks or marked disused/closed), web-verified closures (closed_confirmed, with evidence ' +
+      'URL) and reopenings. This is the freshness signal you cannot cache: poll it to keep a local copy honest. ' +
+      'Optional since (YYYY-MM-DD) returns only events on/after that date.',
+    inputSchema: {
+      type: 'object',
+      properties: { since: { type: 'string', description: 'Optional ISO date (YYYY-MM-DD), inclusive.' } },
+    },
+  },
+  {
+    name: 'vibe_search',
+    description:
+      'Semantic / vibe search over the same nationwide ramen DB — describe what you feel like eating in ' +
+      'natural language, English or Japanese ("rich creamy pork broth", "あっさり淡麗な醤油", "oily mazesoba", ' +
+      '"tsukemen near Ebisu station"), and get the closest shops by meaning, each with a similarity score. ' +
+      'Powered by multilingual embeddings (bge-m3), so English queries find shops with Japanese-only names. ' +
+      'Role split: use search_ramen for exact facts (shop name lookup, keito/prefecture/status filters, ' +
+      'geo radius) — use vibe_search for descriptive/fuzzy queries where no exact filter fits. ' +
+      'Style rankings reflect only classified shops (~25%); unclassified shops still match by name and place. ' +
+      'Tip: concrete food words (style, broth, richness, place, hours) match far better than abstract mood ' +
+      'words ("stylish", "hardcore") — translate moods into concrete attributes before querying. ' +
+      'Prefecture intent in the query text (北海道, 博多の…) is auto-applied as a filter (pref_source: inferred); ' +
+      'region-style names (札幌ラーメン, 喜多方, 佐野…) stay pure style words and never restrict location.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', description: 'Natural-language description, English or Japanese (e.g. "rich creamy pork bone broth", "辛い味噌", "brothless oily noodles").' },
+        limit: { type: 'number', description: 'Max results (default 10, max 20).' },
+        pref: { type: 'string', description: 'Optional prefecture filter, Japanese (東京都/千葉県, short 千葉 OK) or romaji (tokyo/osaka).' },
+        status: { type: 'string', description: "Optional: active (default) / closed_confirmed / all." },
+        richness: { type: 'string', description: 'Optional broth-richness filter from official-site enrichment: assari / kotteri / futsu / menu_varies. Auto-inferred from the query text (あっさり/こってり…) when omitted.' },
+        hours: { type: 'string', description: 'Optional hours filter: morning / late_night / 24h. Auto-inferred from the query text (朝/深夜/24時間…) when omitted.' },
+      },
+      required: ['q'],
+    },
+  },
 ];
+
+// ---- Capability metadata: annotations + output schemas ------------------------------------------
+// Raises Smithery's Capability Quality (Output schemas + Annotations) and sharpens tool selection in
+// every MCP client. All tools are strictly read-only and never mutate anything (destructiveHint:false,
+// idempotentHint:true). Realtime relays reach the live outside world (openWorldHint:true); DB/KV
+// lookups are a closed domain (false). Output schemas are OPEN objects (documented top-level fields,
+// additionalProperties allowed, nothing required) so both success and error payloads validate against
+// the structuredContent we now return.
+const REALTIME_TOOLS = new Set(['get_station_hazard', 'get_active_alerts', 'get_station_alerts', 'get_train_status']);
+const TOOL_TITLES = {
+  ping: 'Connection test / health check',
+  get_municipality_context: 'Municipality context (official data)',
+  get_station_context: 'Station-area context (official data)',
+  get_toilet_by_station: 'Accessible toilets in a station',
+  get_public_toilet_by_city: 'Public toilets in a city',
+  get_station_hazard: 'Station disaster-risk (official)',
+  station_search: 'Station discovery (semantic + filters)',
+  get_active_alerts: 'Live JMA flood/landslide alerts',
+  get_station_alerts: 'Live JMA alerts near a station',
+  get_train_status: 'Live Tokyo-area train status',
+  search_ramen: 'Search ramen shops (nationwide)',
+  get_ramen_shop: 'Get one ramen shop',
+  get_ramen_changes: 'Ramen DB change feed',
+  vibe_search: 'Semantic vibe search (ramen)',
+};
+// Leaf/nested fields are documented by name + description but left type-flexible: real payloads use
+// unions the way live data does (attribution is an object OR an array of sources; keito/coverage are
+// strings OR arrays; some fields are null when data is absent; definitions is a note string in the
+// no-auth preview). Only the root and array-of-record fields carry a `type`, so structuredContent
+// always validates — success and error payloads alike — while agents still see the field map.
+const s = (description) => ({ description });                          // scalar/variant leaf (may be null)
+const obj = (description) => ({ description });                        // nested object (may be null/absent)
+const arr = (description) => ({ type: 'array', description, items: { type: 'object', additionalProperties: true } });
+const ATTR_PROP = { attribution: s('Data source(s), license and provenance — an object, or an array of sources.') };
+const openObj = (properties, description) => ({ type: 'object', description, properties: { ...properties, ...ATTR_PROP }, additionalProperties: true });
+const RAMEN_SHOP_ITEM = {
+  type: 'object', additionalProperties: true,
+  properties: {
+    id: s('Stable shop id (rk_000851).'),
+    name: s('Shop name (Japanese).'),
+    name_en: s('Romanized/English name.'),
+    pref: s('Prefecture.'), city: s('Municipality.'),
+    keito: s('Ramen style(s) if classified — fine 19-value vocabulary (tonkotsu/champon/toripaitan/asahikawa…); [] = unclassified.'),
+    status: s('active / closed_candidate / closed_confirmed.'),
+  },
+};
+const TOOL_OUTPUT_SCHEMAS = {
+  search_ramen: openObj({
+    query: obj('Echo of the resolved query.'), count: s('Results returned.'), total_matched: s('Total matches before limit.'),
+    shops: { type: 'array', description: 'Matching shops.', items: RAMEN_SHOP_ITEM }, note: s('Human-readable note.'),
+    data_as_of: s('Dataset freshness date (YYYY-MM-DD).'),
+  }, 'Ramen search results with freshness metadata.'),
+  get_ramen_shop: openObj({
+    shop: RAMEN_SHOP_ITEM, definitions: obj('Field definitions (or a note string in the no-auth preview).'),
+    data_as_of: s('Dataset freshness date.'), error: s('Set when the shop was not found.'),
+  }, 'One ramen shop (full record) or an error.'),
+  get_ramen_changes: openObj({
+    dataset: s('Dataset id.'), generated_at: s('Feed generation timestamp.'), since: s('Echo of the since filter.'),
+    count: s('Number of events.'), events: arr('Change events (new / closure_candidate / closed_confirmed / reopened).'),
+    definitions: obj('Event-type definitions (or a note string in the no-auth preview).'),
+    window: obj('Time window covered.'), data_as_of: s('Dataset freshness date.'),
+  }, 'Change feed: new shops, closure candidates, verified closures, reopenings.'),
+  vibe_search: openObj({
+    query: obj('Echo of the resolved query.'), count: s('Results returned.'),
+    shops: { type: 'array', description: 'Closest shops by meaning, best first.', items: { ...RAMEN_SHOP_ITEM, properties: { ...RAMEN_SHOP_ITEM.properties, similarity: s('Cosine similarity of this shop to the query (0–1, higher = closer).') } } },
+    note: s('Human-readable note.'), data_as_of: s('Dataset freshness date (YYYY-MM-DD).'),
+  }, 'Semantic search results (lite shape + similarity score).'),
+  get_toilet_by_station: openObj({
+    station: s('Resolved station (English).'), station_ja: s('Station name in Japanese.'), station_name_source: s('How the name was resolved.'),
+    count: s('Toilets returned.'), layer: s('Data layer (e.g. in_station_gate).'),
+    toilets: arr('Accessible toilets with floor, gender, equipment and nearest exit.'), source: s('Data source label.'),
+    note: s('Human-readable note.'), error: s('Set when nothing was found.'),
+  }, 'Wheelchair-accessible / multipurpose toilets inside a station.'),
+  get_public_toilet_by_city: openObj({
+    city: s('Resolved municipality.'), count: s('Toilets returned.'),
+    toilets: arr('Public toilets with wheelchair / baby-seat / ostomate flags, address and coordinates.'),
+    note: s('Human-readable note.'), error: s('Set when nothing was found.'),
+  }, 'Public toilets in a municipality.'),
+  get_station_hazard: openObj({
+    station: obj('Resolved station + coordinates.'),
+    hazard: obj('Official categories: flood inundation depth, landform/liquefaction, storm-surge.'),
+    disclaimer: s('Usage disclaimer (not a substitute for official maps).'),
+  }, 'Official disaster-risk categories at a station (MLIT relay).'),
+  station_search: openObj({
+    query: s('Echo of the query.'), count: s('Results returned.'),
+    applied_filters: obj('Hard metadata filters actually applied (explicit + inferred).'),
+    soft_filters: arr('Inferred facility filters applied as BOOST (confirmed first, unknown demoted — not excluded), with coverage note. Present only when active.'),
+    filter_source: s('explicit / inferred / none — how the filters were chosen.'),
+    stations: arr('Matching stations, best first: name, pref, similarity, ramen stats, toilet stats, official hazard categories (plus risk_notes when an official hazard category not covered by the filter is high), lines, ridership.'),
+    note: s('Present when the query contains taste/quality words: they are not evaluated (no review data).'),
+    notes: s('Coverage caveats (toilet stats Tokyo-only, ridership Greater-Tokyo-only).'),
+    stats_as_of: s('Freshness of the underlying ramen stats (YYYY-MM-DD).'),
+    disclaimer: s('Hazard usage disclaimer.'),
+  }, 'Semantic station discovery with hybrid filters.'),
+  get_active_alerts: openObj({
+    coverage: s('What this feed covers — string or array of categories.'), fetched_at: s('When the snapshot was fetched.'),
+    stale: s('True if the snapshot is stale.'), count: s('Number of active alerts.'),
+    alerts: arr('Active JMA river-flood / landslide alerts with level, area, summary, issue time.'),
+    source: s('Source label.'), disclaimer: s('Relay disclaimer (not a warning issued by this service).'),
+  }, 'Live JMA river-flood & landslide alerts.'),
+  get_station_alerts: openObj({
+    station: obj('Resolved station.'), fetched_at: s('When the snapshot was fetched.'), stale: s('True if stale.'),
+    count: s('Number of alerts.'), alerts: arr('JMA alerts affecting the prefecture.'),
+    disclaimer: s('Relay disclaimer.'),
+  }, "Live JMA alerts for a station's prefecture."),
+  get_train_status: openObj({
+    query: s('Echo of the query.'), fetched_at: s('When the snapshot was fetched.'), stale: s('True if stale.'),
+    count: s('Number of lines.'), lines: arr('Per-line status: normal / delayed / suspended / resumed, with cause.'),
+  }, 'Live Tokyo-area train service status.'),
+  get_municipality_context: openObj({
+    municipality: obj('Resolved municipality + code.'), vacancy: obj('Housing-vacancy counts (2003–2023).'),
+    ridership: obj('Nearest-station ridership trend.'), population: obj('Population / future estimate.'),
+    hazard: obj('Hazard categories.'), hazard_disclaimer: s('Hazard usage disclaimer.'),
+    land_price: obj('Published land prices near the centroid.'), livability: obj('Livability counts.'),
+  }, 'Official municipality data (vacancy, ridership, hazard, land price, livability).'),
+  get_station_context: openObj({
+    station: obj('Resolved station.'), municipality: obj('Municipality + code.'), vacancy: obj('Housing-vacancy counts.'),
+    ridership: obj('Ridership trend.'), population: obj('Population / future estimate.'), hazard: obj('Hazard categories.'),
+    land_price: obj('Land prices near the centroid.'), livability: obj('Livability counts.'),
+  }, "Official data for a station's municipality."),
+};
+for (const t of TOOLS) {
+  t.annotations = {
+    title: TOOL_TITLES[t.name] || t.name,
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: REALTIME_TOOLS.has(t.name),
+  };
+  if (TOOL_OUTPUT_SCHEMAS[t.name]) t.outputSchema = TOOL_OUTPUT_SCHEMAS[t.name];
+}
 
 async function lookup(env, prefix, query) {
   const exact = await env.TOILET_KV.get(`${prefix}${query}`, 'json');
@@ -267,6 +679,9 @@ function toEnglishToilet(r) {
     name: toiletNameEn(r.name),
     name_ja: r.name || null,
     type: 'accessible',
+    operator: r.operator ?? null,          // in-station层: 事業者名 (JR東日本 等)
+    gate: r.gate ?? null,                   // 'inside' | 'outside' | null (改札内/外)
+    gate_ja: r.gate_ja ?? null,
     line: lineEn(r.line),
     line_ja: cleanLine(r.line) || null,
     floor: r.floor || null,
@@ -285,7 +700,10 @@ async function toEnglishStation(env, found) {
     station_ja: found.station,
     station_name_source: en ? 'odpt' : 'japanese_fallback',
     count: found.count,
+    layer: found.layer ?? null,     // 'in_station_gate' = 改札内/外つき(都外主要駅) / null = 東京都福祉局の多目的
     toilets: (found.toilets || []).map(toEnglishToilet),
+    source: found.source ?? null,
+    note: found.note ?? null,
   };
 }
 function toEnglishCity(found) {
@@ -560,6 +978,15 @@ function rpcResult(id, result) {
 function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
+// A tool result: the serialized JSON as a text block (universal) AND structuredContent (MCP 2025-06-18).
+// Declaring an outputSchema per tool means spec-conformant clients expect structuredContent, so every
+// tool payload is mirrored here. The payload object is unchanged — same data, same fields.
+function mcpResult(id, payload) {
+  return rpcResult(id, {
+    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+    structuredContent: payload,
+  });
+}
 
 function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -582,11 +1009,16 @@ async function resolveAuth(request, env) {
   if (scheme !== 'Bearer' || !token) return { ok: false };
   // admin/master key (env secret) — unlimited, for internal testing
   if (env.API_KEY && timingSafeEqual(token, env.API_KEY)) {
-    return { ok: true, plan: 'admin', token };
+    return { ok: true, plan: 'admin', product: 'all', token };
   }
   const record = await env.TOILET_KV.get(`key:${token}`, 'json');
   if (!record || record.status !== 'active') return { ok: false };
-  return { ok: true, plan: record.plan || 'free', token };
+  // Legacy trial keys (retired plan) are coerced to Free — they keep working nationwide, never error,
+  // and expiry is no longer enforced. New keys are only ever 'free' or a paid plan.
+  const plan = record.plan === 'trial' ? 'free' : (record.plan || 'free');
+  // product scope: 'ramen' | 'gachi' | 'all'. Legacy keys (no product) default to 'gachi' so a key
+  // issued via the general API can NEVER reach the standalone ramen product (fail-closed).
+  return { ok: true, plan, product: record.product || 'gachi', token };
 }
 
 function monthKey() {
@@ -605,14 +1037,120 @@ async function meterUsage(env, token, plan) {
   return { allowed: true, used: used + 1, limit };
 }
 
-async function issueFreeKey(env, email) {
+// All keyed plans meter PER MONTH. Returns { allowed, used, limit, daily:false } — `daily` is kept
+// for callers that word the limit message, always false now that the daily-metered trial is gone.
+async function meterUsageFor(env, auth) {
+  return { ...(await meterUsage(env, auth.token, auth.plan)), daily: false };
+}
+
+async function issueFreeKey(env, email, product = 'gachi') {
   const token = randToken('gk_free_');
-  const record = { plan: 'free', email, status: 'active', created: new Date().toISOString() };
+  const record = { plan: 'free', email, product, status: 'active', created: new Date().toISOString() };
   await env.TOILET_KV.put(`key:${token}`, JSON.stringify(record));
   // bump a simple issuance counter (KPI)
   const c = parseInt((await env.TOILET_KV.get('stat:keys_issued')) || '0', 10);
   await env.TOILET_KV.put('stat:keys_issued', String(c + 1));
   return token;
+}
+
+// No-auth usage counters. The Free tier is keyless (rate-limit only), so per-key metering can't see it —
+// these daily tallies are the ONLY way to tell whether the public MCP/REST endpoints are actually being
+// called (e.g. after outreach). Fire-and-forget via waitUntil so counting never adds latency or can fail
+// the response. Read-modify-write is eventually consistent (may undercount under bursts) — fine for a KPI.
+// Per-host, per-method MCP usage: stat:mcp:<api|ramen>:<call|list>:<YYYY-MM-DD> (self-expire ~100d).
+// Counts ALL tools/call + tools/list (keyed AND no-auth) that reach the dispatcher — so we can tell
+// real tool USE (call) apart from directory/connector introspection (list), separately per product.
+function bumpMcpMethodStat(env, ctx, host, method) {
+  const short = method === 'tools/call' ? 'call' : method === 'tools/list' ? 'list' : null;
+  if (!short) return;
+  const key = `stat:mcp:${host}:${short}:${new Date().toISOString().slice(0, 10)}`;
+  const p = (async () => {
+    try {
+      const c = parseInt((await env.TOILET_KV.get(key)) || '0', 10);
+      await env.TOILET_KV.put(key, String(c + 1), { expirationTtl: 100 * 86400 });
+    } catch (e) { /* never let counting affect serving */ }
+  })();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {});
+}
+
+// Counterpart to bumpMcpMethodStat for our OWN scripts (x-gachi-internal: 1) — same shape, separate
+// key, so internal QA/benchmark traffic never inflates the external-usage KPI but a spike is still
+// visible if we go looking. Key: stat:mcp:internal:<api|ramen>:<call|list>:<YYYY-MM-DD>.
+function bumpInternalStat(env, ctx, host, method) {
+  const short = method === 'tools/call' ? 'call' : method === 'tools/list' ? 'list' : null;
+  if (!short) return;
+  const key = `stat:mcp:internal:${host}:${short}:${new Date().toISOString().slice(0, 10)}`;
+  const p = (async () => {
+    try {
+      const c = parseInt((await env.TOILET_KV.get(key)) || '0', 10);
+      await env.TOILET_KV.put(key, String(c + 1), { expirationTtl: 100 * 86400 });
+    } catch (e) { /* never let counting affect serving */ }
+  })();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {});
+}
+
+// Channel attribution via ?ref=<tag>. Purpose: measure which posting channel (r/ClaudeAI vs r/mcp vs
+// HN vs dev.to …) produces actual CONNECTIONS, not impressions. A client opening the MCP URL with
+// ?ref=rmcp is counted on initialize (handshake = someone wired the connection up) and on every
+// tools/call (real use) — the two events that mean "a human from this channel connected and used it".
+// Key: ref:<YYYY-MM-DD>:<api|ramen>:<ref>:<initialize|tools_call> (UTC date, matching stat:mcp so the
+// buckets line up; self-expire ~120d). Requests with NO ref are not counted — the stat:mcp:* host
+// totals already hold everything, so "no ref" = total minus the sum of the ref buckets. Observation
+// only: ref NEVER changes the response, and no IP/UA is ever stored next to it.
+// Normalize defensively so a hostile or malformed ?ref can't pollute logs or explode the keyspace:
+// lowercase, keep only [a-z0-9-], cap at 16 chars; empty-after-strip -> not counted.
+function normalizeRef(raw) {
+  if (!raw) return null;
+  const r = String(raw).toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 16);
+  return r || null;
+}
+function bumpRefStat(env, ctx, host, rawRef, method) {
+  const label = method === 'initialize' ? 'initialize' : method === 'tools/call' ? 'tools_call' : null;
+  if (!label) return;
+  const ref = normalizeRef(rawRef);
+  if (!ref) return;
+  const key = `ref:${new Date().toISOString().slice(0, 10)}:${host}:${ref}:${label}`;
+  const p = (async () => {
+    try {
+      const c = parseInt((await env.TOILET_KV.get(key)) || '0', 10);
+      await env.TOILET_KV.put(key, String(c + 1), { expirationTtl: 120 * 86400 });
+    } catch (e) { /* never let counting affect serving */ }
+  })();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {});
+}
+
+// Per-tool daily counter, ramen host ONLY. Sole purpose: retention — did day-1 connectors come back
+// a week later and call anything? Keys: stats:<JST-YYYY-MM-DD>:<toolName|initialize>. JST so a "day"
+// matches how we report it. tools/call is bucketed by tool name; initialize is counted as a proxy for
+// a connection attempt. No IP/UA (privacy + KV write volume — the raw CF logs already have those).
+// Async via waitUntil — never on the serving path; a KV failure must not touch the response.
+function bumpRamenToolStat(env, ctx, method, toolName) {
+  let label = null;
+  if (method === 'initialize') label = 'initialize';
+  else if (method === 'tools/call' && toolName) label = toolName;
+  if (!label) return;
+  const p = (async () => {
+    try {
+      const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      const key = `stats:${jst}:${label}`;
+      const c = parseInt((await env.TOILET_KV.get(key)) || '0', 10);
+      await env.TOILET_KV.put(key, String(c + 1), { expirationTtl: 120 * 86400 });
+    } catch (e) { /* counting must never affect serving */ }
+  })();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {});
+}
+
+// Keys: stat:ramen_noauth:<mcp|rest>:<YYYY-MM-DD>, self-expiring after ~100 days.
+function bumpNoauthStat(env, ctx, kind) {
+  const p = (async () => {
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const key = `stat:ramen_noauth:${kind}:${day}`;
+      const c = parseInt((await env.TOILET_KV.get(key)) || '0', 10);
+      await env.TOILET_KV.put(key, String(c + 1), { expirationTtl: 100 * 86400 });
+    } catch (e) { /* never let counting affect serving */ }
+  })();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p); else p.catch(() => {});
 }
 
 // Approximate per-IP + global daily cap on free-key minting (abuse backstop against mass automated
@@ -631,6 +1169,39 @@ async function mintRateLimit(env, request, perIp = 20, globalCap = 1000) {
   await env.TOILET_KV.put(ipK, String(ipN + 1), { expirationTtl: 172800 });
   await env.TOILET_KV.put(gK, String(gN + 1), { expirationTtl: 172800 });
   return { ok: true };
+}
+
+// Per-IP rate limit for the no-auth public tools, backed by the Cloudflare Workers native
+// rate-limiting binding (in-colo, fast, no KV consistency lag). 60 requests/min/IP. Only the
+// key-less public-tool call path hits this — keyed traffic is metered by its plan quota, untouched.
+// Fail-open if the binding is absent (e.g. an old build) so a config gap can't take the tools down.
+async function noauthCallLimit(env, request) {
+  if (!env.NOAUTH_LIMITER) return { ok: true };
+  const ip = request.headers.get('cf-connecting-ip') || 'noip';
+  const { success } = await env.NOAUTH_LIMITER.limit({ key: `mcp-noauth:${ip}` });
+  return { ok: success };
+}
+
+// Per-API-key BURST limit (requests/second) by plan, for keyed MCP + REST traffic. Separate from the
+// monthly quota: "unlimited" (ramen_pro) still gets a QPS ceiling so a crawler can't scrape at line
+// speed — unlimited VOLUME, not unlimited SPEED. admin (internal master key) and any unmapped plan
+// are exempt (fail-open). Backed by 10s-window native limiters (see wrangler.jsonc).
+const KEYED_RL = {
+  free:       { binding: 'KEY_RL_1RPS',  rps: 1 },
+  pro:        { binding: 'KEY_RL_5RPS',  rps: 5 },
+  all_access: { binding: 'KEY_RL_10RPS', rps: 10 },
+  business:   { binding: 'KEY_RL_10RPS', rps: 10 },
+  enterprise: { binding: 'KEY_RL_15RPS', rps: 15 },
+  ramen_pro:  { binding: 'KEY_RL_15RPS', rps: 15 },
+  // admin: exempt (internal master key)
+};
+async function keyedBurstLimit(env, auth) {
+  const cfg = KEYED_RL[auth.plan];
+  if (!cfg) return { ok: true };            // admin / unknown plan → no burst cap
+  const binding = env[cfg.binding];
+  if (!binding) return { ok: true };        // binding missing → fail-open, never take paid traffic down
+  const { success } = await binding.limit({ key: `k:${auth.token}` });
+  return { ok: success, rps: cfg.rps };
 }
 
 // ---- OAuth 2.1 (MCP remote auth for claude.ai web / Desktop connectors) ------
@@ -657,7 +1228,12 @@ function oauthRedirectAllowed(uri, registered) {
     return registered.some((r) => { try { const ru = new URL(r); return isLoopbackHost(ru.hostname) && ru.pathname === u.pathname; } catch { return false; } });
   } catch { return false; }
 }
-function protectedResourceMetadata() {
+function protectedResourceMetadata(isRamen) {
+  // Advertise a host-specific resource so the client's RFC 8707 resource indicator lets us scope the
+  // issued key to the right product (ramen keys must not be minted for api.-origin OAuth and vice versa).
+  if (isRamen) {
+    return { resource: `https://${RAMEN_HOST}/mcp`, authorization_servers: [OAUTH_ISSUER], scopes_supported: [OAUTH_SCOPE], bearer_methods_supported: ['header'], resource_name: 'Japan Ramen Active Master', resource_documentation: `https://${RAMEN_HOST}` };
+  }
   return { resource: OAUTH_RESOURCE, authorization_servers: [OAUTH_ISSUER], scopes_supported: [OAUTH_SCOPE], bearer_methods_supported: ['header'], resource_name: 'Gachi Data API', resource_documentation: `${OAUTH_ISSUER}/docs` };
 }
 function authServerMetadata() {
@@ -672,27 +1248,38 @@ function oauthErrPage(error, desc) {
 function oauthConsentPage(reqUrl) {
   const approve = new URL(reqUrl); approve.searchParams.set('approve', '1');
   const href = approve.toString().replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize — Gachi Data API</title></head><body><div style="font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:460px;margin:56px auto;padding:0 20px;color:#1a1a1a">
-<h1 style="font-size:22px;margin:0 0 8px">Connect to Gachi Data API</h1>
-<p>You're authorizing an MCP client to query <b>Gachi Data API</b> — Japan station, accessibility &amp; hazard data — on the <b>free tier</b> (1,000 requests/month).</p>
-<p style="color:#666;font-size:14px">No account needed. A free-tier key is created for this connection; disconnect anytime to stop using it.</p>
+  // Brand by the RFC 8707 resource indicator: a client connecting to ramen.*/mcp gets the ramen
+  // product (and a ramen-scoped key at /token), so the consent must say so — not "Gachi Data API".
+  const isRamen = (reqUrl.searchParams.get('resource') || '').includes(RAMEN_HOST);
+  const title = isRamen ? 'Japan Ramen Active Master' : 'Gachi Data API';
+  const blurb = isRamen
+    ? 'query <b>Japan Ramen Active Master</b> — 62,000+ active Japanese ramen stores nationwide, <b>free</b> (all 47 prefectures)'
+    : 'query <b>Gachi Data API</b> — Japan station, accessibility &amp; hazard data';
+  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize — ${title}</title></head><body><div style="font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:460px;margin:56px auto;padding:0 20px;color:#1a1a1a">
+<h1 style="font-size:22px;margin:0 0 8px">Connect to ${title}</h1>
+<p>You're authorizing an MCP client to ${blurb}${isRamen ? '' : ' — on the <b>free tier</b>'}.</p>
+<p style="color:#666;font-size:14px">No account needed. ${isRamen ? `A free key is created for this connection — all 47 prefectures, 1,000 requests/day; upgrade to Pro anytime for unlimited volume, REST and a commercial licence.` : 'A free-tier key is created for this connection; disconnect anytime to stop using it.'}</p>
 <p style="margin-top:22px"><a href="${href}" style="display:inline-block;background:#0b6;color:#fff;text-decoration:none;padding:11px 22px;border-radius:6px;font-weight:600">Authorize</a></p>
 <p style="color:#999;font-size:12px;margin-top:28px">Powered by api.gachi-tokusuru.com · <a href="/docs" style="color:#0b6">docs</a></p>
 </div></body></html>`, { headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
-async function issuePaidKey(env, plan, { email, customer, session }) {
+async function issuePaidKey(env, plan, { email, customer, session, test }) {
   const meta = PLAN_META[plan];
   const token = randToken(meta.prefix);
   const record = {
     plan, email, status: 'active',
+    product: meta.product || 'gachi', // scope paid key to its product (ramen_pro → 'ramen', else 'gachi')
     stripe_customer_id: customer || null,
     stripe_session_id: session || null,
     created: new Date().toISOString(),
+    ...(test ? { test: true } : {}), // sandbox-issued: identifiable + excluded from paid stats
   };
   await env.TOILET_KV.put(`key:${token}`, JSON.stringify(record));
-  const c = parseInt((await env.TOILET_KV.get(meta.stat)) || '0', 10);
-  await env.TOILET_KV.put(meta.stat, String(c + 1));
+  if (!test) { // don't inflate production paid-key stats with sandbox test issuances
+    const c = parseInt((await env.TOILET_KV.get(meta.stat)) || '0', 10);
+    await env.TOILET_KV.put(meta.stat, String(c + 1));
+  }
   return token;
 }
 
@@ -770,28 +1357,34 @@ async function activate(env, sessionId) {
   const cached = await env.TOILET_KV.get(`session:${sessionId}`, 'json');
   if (cached) return { ok: true, ...cached }; // already activated → same key (no re-issue, no re-email)
 
+  // Test-mode sessions (cs_test_*) must be verified with the test secret key, live with the live key.
+  const isTest = sessionId.startsWith('cs_test_');
+  const stripeKey = isTest ? env.STRIPE_SECRET_KEY_TEST : env.STRIPE_SECRET_KEY;
+  if (!stripeKey) return { ok: false, reason: isTest ? 'test_key_missing' : 'verify_failed' };
+
   const resp = await fetch(
     `https://api.stripe.com/v1/checkout/sessions/${sessionId}?expand[]=line_items`,
-    { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } },
+    { headers: { Authorization: `Bearer ${stripeKey}` } },
   );
   if (!resp.ok) return { ok: false, reason: 'verify_failed' };
   const s = await resp.json();
   if (s.payment_status !== 'paid') return { ok: false, reason: 'not_paid' };
 
   // Resolve plan from the line-item amount (fall back to the session amount_total).
+  // In test mode, default to ramen_pro if the amount isn't mapped, so any sandbox price works.
   const li = s.line_items?.data?.[0];
   const amount = li?.price?.unit_amount ?? li?.amount_total ?? s.amount_total;
-  const plan = AMOUNT_TO_PLAN[amount];
+  const plan = AMOUNT_TO_PLAN[amount] || (isTest ? 'ramen_pro' : null);
   if (!plan) {
     console.log(`activate: unmapped amount ${amount} (session ${sessionId}) — add it to AMOUNT_TO_PLAN`);
     return { ok: false, reason: 'unknown_plan' };
   }
 
   const email = s.customer_details?.email || s.customer_email || '';
-  const key = await issuePaidKey(env, plan, { email, customer: s.customer, session: sessionId });
+  const key = await issuePaidKey(env, plan, { email, customer: s.customer, session: sessionId, test: isTest });
   // Backup delivery by email — only here on first issuance, so it never re-sends on a revisit.
   const mail = await sendKeyEmail(env, { email, plan, key });
-  const rec = { key, plan, email, emailed: !!mail.sent };
+  const rec = { key, plan, email, emailed: !!mail.sent, ...(isTest ? { test: true } : {}) };
   await env.TOILET_KV.put(`session:${sessionId}`, JSON.stringify(rec));
   return { ok: true, ...rec };
 }
@@ -817,44 +1410,140 @@ async function saveInterest(env, email, useCase) {
 }
 
 // ---- MCP JSON-RPC --------------------------------------------------------
-async function handleRpc(body, env) {
+async function handleRpc(body, env, opts = {}) {
   const { id, method, params } = body;
+  // On ramen.gachi-tokusuru.com the MCP surface is scoped to the ramen product only.
+  // On api.* (the full data API) the ramen tools are EXCLUDED — the standalone ramen product
+  // must not be reachable through a general Gachi Data API key (close the back door).
+  const ramenOnly = opts.ramenOnly === true;
+  // ramen.* shows ONLY the ramen tools; api.* shows everything EXCEPT them. tools/list is open on
+  // both (no auth needed for discovery), and on api.* every listed tool is also callable no-auth.
+  // ping is a health check shown on BOTH surfaces; every other ramen tool stays scoped to ramen.*,
+  // and api.* shows everything except the ramen tools.
+  const visibleTools = ramenOnly
+    ? TOOLS.filter((t) => RAMEN_TOOL_NAMES.has(t.name) || t.name === 'ping')
+    : TOOLS.filter((t) => !RAMEN_TOOL_NAMES.has(t.name));
 
   if (method === 'initialize') {
     return rpcResult(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: {
-        name: 'gachi-data-api',
-        version: '0.3.0',
-        description: "Deep, obscure Japanese data you won't find anywhere else — stations, accessibility, vacancy, hazards. Hand-verified, English-first, built for AI agents.",
-      },
+      serverInfo: ramenOnly
+        ? {
+          name: 'japan-ramen-active-master',
+          title: 'Japan Ramen Active Master',
+          version: '0.3.0',
+          description: '62,268 active ramen shops across all 47 prefectures of Japan. Names verified by dual-AI audit (26,975 romanization fixes); liveness re-verified monthly with web-checked closure evidence, and every response is stamped with its data_as_of date. No auth, no signup. Yes, we have both ramen shops on Iriomote Island.',
+          websiteUrl: 'https://ramen.gachi-tokusuru.com',
+          homepage: 'https://ramen.gachi-tokusuru.com',
+          icon: 'https://ramen.gachi-tokusuru.com/icon.svg',
+        }
+        : {
+          name: 'gachi-data-api',
+          title: 'Gachi Data API — Japan life & safety data',
+          version: '0.3.0',
+          description: '9 tools for Japan life & safety data: semantic station discovery (9,035 stations — ramen density, accessibility, official hazard), station restrooms & accessibility (526 Tokyo stations), live train status, JMA flood/landslide alerts, hazard risk and official statistics for any station or municipality. Government open data, no auth.',
+          websiteUrl: 'https://toilet.gachi-tokusuru.com/en',
+          homepage: 'https://toilet.gachi-tokusuru.com/en',
+          icon: 'https://api.gachi-tokusuru.com/icon.svg',
+        },
     });
   }
   if (method === 'notifications/initialized') return null;
   if (method === 'tools/list') {
-    return rpcResult(id, { tools: TOOLS.map(({ prefix, argName, attribution, ...t }) => t) });
+    return rpcResult(id, {
+      tools: visibleTools.map(({ prefix, argName, attribution, ...t }) =>
+        // ping's default metadata is the api variant; swap to the ramen variant on ramen.*.
+        (t.name === 'ping' && ramenOnly)
+          ? { ...t, description: PING_DESC_RAMEN, outputSchema: PING_OUTPUT_SCHEMA_RAMEN }
+          : t),
+    });
   }
   if (method === 'tools/call') {
-    const tool = TOOLS.find((t) => t.name === params?.name);
+    const tool = visibleTools.find((t) => t.name === params?.name);
     if (!tool) return rpcError(id, -32602, `unknown tool: ${params?.name}`);
+    // Connection test / health check — host-specific identity + live freshness (no auth, no args).
+    if (tool.name === 'ping') {
+      const payload = ramenOnly ? await pingRamenPayload(env) : await pingApiPayload(env, visibleTools.length);
+      return mcpResult(id, payload);
+    }
     // Hazard tool: name -> coords -> live reinfolib relay (not a KV toilet lookup).
     if (tool.name === 'get_station_hazard') {
       const payload = await hazardPayload(env, params?.arguments?.station_name);
-      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+      return mcpResult(id, payload);
+    }
+    // Semantic station discovery (Vectorize gachi-station-vibe + hybrid metadata filters).
+    if (tool.name === 'station_search') {
+      const payload = await stationSearchPayload(env, params?.arguments || {});
+      return mcpResult(id, payload);
     }
     // Realtime relays (KV snapshots written by the host pipelines).
     if (tool.name === 'get_active_alerts') {
       const payload = await activeAlertsPayload(env, (params?.arguments?.area || '').trim() || null);
-      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+      return mcpResult(id, payload);
     }
     if (tool.name === 'get_station_alerts') {
       const payload = await stationAlertsPayload(env, params?.arguments?.station_name);
-      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+      return mcpResult(id, payload);
     }
     if (tool.name === 'get_train_status') {
       const payload = await trainStatusPayload(env, params?.arguments?.query);
-      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+      return mcpResult(id, payload);
+    }
+    // Ramen DB (KV dataset with monthly freshness sync).
+    if (tool.name === 'search_ramen') {
+      const a = params?.arguments || {};
+      const payload = await ramenSearchPayload(env, {
+        pref: (a.pref || '').trim() || null, city: (a.city || '').trim() || null,
+        keito: (a.keito || '').trim() || null, status: (a.status || '').trim() || null,
+        q: (a.q || '').trim() || null,
+        chain: (a.chain || '').trim() || null,
+        chainSub: (a.chain_sub || '').trim() || null,
+        match: (a.match || '').trim() || null,
+        lat: typeof a.lat === 'number' ? a.lat : parseFloat(a.lat),
+        lng: typeof a.lng === 'number' ? a.lng : parseFloat(a.lng),
+        radius: a.radius_m, limit: a.limit,
+        // No-auth: all 47 prefectures, but limit capped 20 and nearby radius capped 2,000 m (clamped).
+        ...(opts.ramenNoauth ? { maxLimit: 20, maxRadius: 2000 } : {}),
+      });
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return mcpResult(id, payload);
+    }
+    if (tool.name === 'get_ramen_shop') {
+      const a = params?.arguments || {};
+      let payload;
+      if ((a.id || '').trim()) {
+        payload = (await ramenShopPayload(env, a.id.trim()))
+          || { error: `Unknown shop id "${a.id}".`, attribution: RAMEN_ATTR };
+      } else if ((a.name || '').trim()) {
+        payload = await ramenShopByName(env, a.name.trim(), (a.pref || '').trim() || null, (a.city || '').trim() || null);
+      } else {
+        payload = { error: 'Provide id (rk_000851) or name + pref.', attribution: RAMEN_ATTR };
+      }
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return mcpResult(id, payload);
+    }
+    if (tool.name === 'get_ramen_changes') {
+      // No-auth: cap to the last 7 days and ≤50 events so the full changes feed (a Pro deliverable) can't be bulk-pulled.
+      const changeOpts = opts.ramenNoauth
+        ? { maxEvents: 50, minDate: new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10) }
+        : {};
+      const payload = await ramenChangesPayload(env, (params?.arguments?.since || '').trim() || null, changeOpts);
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return mcpResult(id, payload);
+    }
+    if (tool.name === 'vibe_search') {
+      const a = params?.arguments || {};
+      const payload = await ramenVibeSearchPayload(env, {
+        q: (a.q || '').trim() || null,
+        pref: (a.pref || '').trim() || null,
+        status: (a.status || '').trim() || null,
+        limit: a.limit,
+        richness: (a.richness || '').trim() || null,
+        hours: (a.hours || '').trim() || null,
+      });
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return mcpResult(id, payload);
     }
     // Municipality Context API (Akiya Stage 2): official municipality data in one call.
     if (tool.name === 'get_municipality_context' || tool.name === 'get_station_context') {
@@ -863,7 +1552,7 @@ async function handleRpc(body, env) {
       const payload = tool.name === 'get_station_context'
         ? await stationContextPayload(env, (a.station_id || a.station_name || '').trim(), fields)
         : await municipalityContextByNameOrCode(env, (a.name_or_code || '').trim(), fields);
-      return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+      return mcpResult(id, payload);
     }
     const query = params?.arguments?.[tool.argName];
     const found = query ? await lookup(env, tool.prefix, query) : null;
@@ -871,11 +1560,12 @@ async function handleRpc(body, env) {
     if (!found) {
       payload = { error: `No data found for "${query}".`, attribution: tool.attribution };
     } else if (tool.name === 'get_toilet_by_station') {
-      payload = { ...(await toEnglishStation(env, found)), attribution: tool.attribution };
+      const attribution = found.layer === 'in_station_gate' ? EKINAI_ATTR : tool.attribution;
+      payload = { ...(await toEnglishStation(env, found)), attribution };
     } else {
       payload = { ...toEnglishCity(found), attribution: tool.attribution };
     }
-    return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] });
+    return mcpResult(id, payload);
   }
   return rpcError(id, -32601, `method not found: ${method}`);
 }
@@ -896,6 +1586,17 @@ const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, OPTIONS',
   'access-control-allow-headers': 'Authorization, Content-Type',
+  'access-control-max-age': '86400',
+};
+
+// CORS for /mcp specifically. Streamable HTTP here is POST-only (we offer no GET/SSE stream), and a
+// browser-side client (Glama's Inspector, MCP Inspector) has to be able to read Mcp-Session-Id back
+// off the response — cross-origin that requires an explicit expose-headers.
+const MCP_CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'POST, OPTIONS',
+  'access-control-allow-headers': 'authorization, content-type, mcp-session-id, mcp-protocol-version',
+  'access-control-expose-headers': 'Mcp-Session-Id',
   'access-control-max-age': '86400',
 };
 
@@ -931,6 +1632,15 @@ const ODPT_ATTR = {
   source: 'Public Transportation Open Data Center (ODPT)',
   provider: 'Association for Open Data of Public Transportation',
   license: 'CC BY 4.0',
+};
+
+// In-station toilet層(改札内/外・都外主要駅)の出典。東京の多目的(福祉局CC BY)とは別ソースなので
+// get_toilet_by_station が layer==='in_station_gate' のレコードを返すときはこちらを使う。
+const EKINAI_ATTR = {
+  source: 'らくらくおでかけネット (Rakuraku Odekake Net) — Ecomo Mobility Foundation, with each railway operator',
+  coverage: 'In-station accessible toilets grouped by ticket gate (inside/outside), for major stations outside Tokyo',
+  note: 'Facility presence relayed as published; floor and exact location are not included — confirm on-site signage.',
+  provider: 'https://toilet.gachi-tokusuru.com',
 };
 
 // English prefecture name (station master) → 2-digit code, for prefecture-level
@@ -992,24 +1702,754 @@ async function trainStatusPayload(env, query) {
   return { query: raw, count: 0, lines: [], note: 'No line or station matched.', attribution: ODPT_ATTR };
 }
 
+// ---- Ramen DB (nationwide) ----
+// KV layout (seeded by build_kv_seed_ramen.py, synced monthly after the ramen refresh):
+//   ramen:meta / ramen:pref:<都道府県> / ramen:ididx / ramen:geo:<gh4> / ramen:changes
+// Provenance (osm_id is 0 across the DB — OSM does NOT contribute; do NOT claim ODbL, that would be
+// false attribution): three layers — (1) facts observed from public web ramen listings, (2) records
+// cross-checked against Japanese municipality open data (CC BY), (3) reverse-geocoded municipality
+// via 国土地理院 (GSI) + our own enrichment. Mirrors ramen:meta.attribution.
+const RAMEN_ATTR = {
+  attribution: '© 各自治体オープンデータ (CC BY) · reverse geocoding © 国土地理院 (GSI) · enrichment © gachi-tokusuru.com',
+  license:
+    'Three layers: (1) store facts observed from public web ramen listings — factual data, no third-party copyright asserted; ' +
+    '(2) licensing-verified records from Japanese municipality open data — © 各自治体オープンデータ, CC BY (attribution required); ' +
+    '(3) derived/enrichment values (keito classification, romanization, station distance, municipality via reverse geocoding © 国土地理院 GSI, rk_ ids) are original © gachi-tokusuru.com.',
+  source_detail: 'contact@gachi-tokusuru.com',
+};
+const RAMEN_DEFS = {
+  status:
+    'active | closed_candidate (missing from the monthly web source 2 consecutive checks, OR marked ' +
+    'disused/closed) | closed_confirmed (closure web-verified, with evidence_url)',
+  reopened:
+    'a closed_candidate found open on web verification (high confidence, no successor record within 200 m) is restored to active',
+  merged:
+    'this id was consolidated into merged_into (duplicate-record dedup 2026-07-31). Old ids stay resolvable: get_ramen_shop / GET /v1/shops/{old_id} return the canonical record with merged_into set',
+  midnight_hours: 'true = open at/after 23:00; null = unknown (never coerced to false)',
+  keito: '19-value ramen-style vocabulary assigned by our classifier (incl. regional schools champon/toripaitan/asahikawa etc.); [] = unclassified (we do not guess)',
+  data_as_of: 'Dataset build date (response-level). Active shops are present in the source as of this date — a DATASET-level freshness signal, not an independent per-shop re-verification.',
+  last_seen: 'Present only on closure records (closed_candidate/closed_confirmed): the last date the shop was seen in the source before it went missing. Omitted for active shops (there it would just equal data_as_of).',
+};
+
+// q matching. partial(default): substring on name(JP) OR name_en(romaji), case/space-insensitive.
+// exact: whole-word match on the romaji name_en, so q=ojiya finds 王子家(Ojiya) but NOT 糀谷(Kojiya)/
+// 木ノ実屋(Kinojiya). The Japanese name stays substring in both modes (kanji is already precise).
+function ramenQMatch(s, q, exact) {
+  if (!q) return true;
+  if ((s.name || '').includes(q)) return true;
+  const en = (s.name_en || '').toLowerCase();
+  const qc = q.toLowerCase().replace(/\s+/g, '');
+  if (!qc) return false;
+  if (exact) return en.split(/\s+/).some((t) => t.replace(/[^a-z0-9]/g, '') === qc);
+  return en.replace(/\s+/g, '').includes(qc);
+}
+
+// Public shape for full shop records. Internal ops/lifecycle fields (st_ id, *_source metadata,
+// osm_id, and the freshness lifecycle internals) stay in KV for our pipeline but are NOT exposed
+// to customers. Kept: the facts a consumer actually uses + status/last_seen + sources (CC BY provenance).
+function ramenPublicShape(s) {
+  if (!s) return s;
+  const st = s.station, p = s.payment, fr = s.freshness || {};
+  // Product thesis: an authoritative registry of ACTIVE Japanese ramen shops — identity + location
+  // done rigorously (name/romaji/address/coords are 100%). Granular per-shop details (hours, url,
+  // phone…) are "look it up on Google", not our job. Empty fields (name_kana/url/url_type/midnight_hours
+  // = 0% coverage) are omitted rather than shipped as noise. Re-add if a future source populates them.
+  return {
+    id: s.id, name: s.name, name_en: s.name_en,
+    pref: s.pref, pref_en: s.pref_en, city: s.city, city_en: s.city_en, address: s.address,
+    lat: s.lat, lng: s.lng,
+    keito: s.keito || [], chain: s.chain || null, chain_sub: s.chain_sub || null, genre: s.genre,
+    // Chain-level attributes from the chain's official site (2026-07 enrichment).
+    // Sparse by design (chains only) — omitted when null rather than shipped as noise.
+    ...(s.richness ? { richness: s.richness } : {}),
+    ...(s.hours_class && s.hours_class.length ? { hours_class: s.hours_class } : {}),
+    ...(s.midnight_hours != null ? { midnight_hours: s.midnight_hours } : {}),
+    station: st ? { name: st.name, name_en: st.name_en, distance_meters: st.distance_meters } : null,
+    payment: p ? { cash_only: p.cash_only, card_accepted: p.card_accepted, qr_accepted: p.qr_accepted, state: p.state } : null,
+    sources: s.sources,
+    // last_seen for an ACTIVE shop is just the dataset build date (uniform across all active shops),
+    // NOT a per-shop re-verification — so we don't expose it there (would overstate freshness). On
+    // closure records it IS meaningful (the frozen last date the shop was seen), so keep it there.
+    // Dataset-level freshness is the response-level data_as_of instead.
+    freshness: (fr.status && fr.status !== 'active')
+      ? { status: fr.status, last_seen: fr.last_seen }
+      : { status: fr.status || 'active' },
+  };
+}
+
+function ramenFilterFull(arr, { city, keito, status, q, exact, chain, chainSub }) {
+  let out = arr;
+  // city matches Japanese city (substring) OR romaji city_en (case/space-insensitive): "kawaguchi" → 川口市.
+  if (city) { const cc = city.toLowerCase().replace(/\s+/g, ''); out = out.filter((s) => (s.city || '').includes(city) || (s.city_en || '').toLowerCase().replace(/\s+/g, '').includes(cc)); }
+  if (keito) out = out.filter((s) => ramenKeitoMatch(s.keito, keito));
+  if (chain) out = out.filter((s) => ramenChainMatch(s.chain, chain));
+  if (chainSub) out = out.filter((s) => (s.chain_sub || '').toLowerCase() === chainSub.toLowerCase());
+  if (status) out = out.filter((s) => ((s.freshness || {}).status || 'active') === status);
+  // q matches the Japanese name (substring) OR the romaji/English name (case-insensitive),
+  // so "butasakashita" / "ichiran" find shops just like 豚坂下 / 一蘭 (English-first product).
+  if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
+  return out;
+}
+
+// chain filter: exact-ish match on the curated chain label (chain_master.csv). NFKC + case-insensitive
+// substring, so chain=ラーメンショップ matches, and chain=yamaokaya-style romaji is NOT attempted (labels
+// are Japanese; romaji users can q= the shop name instead).
+function ramenChainMatch(shopChain, want) {
+  if (!shopChain) return false;
+  const a = String(shopChain).normalize('NFKC').toLowerCase();
+  const b = String(want).normalize('NFKC').toLowerCase();
+  return a.includes(b);
+}
+
+// pref入力の寛容化: 「千葉」→「千葉県」「東京」→「東京都」等。フル形はそのまま通す。
+function ramenNormalizePref(raw) {
+  const p = (raw || '').trim();
+  if (!p) return null;
+  // Romaji input (e.g. "saitama", "Tokyo", "osaka-ken") -> Japanese prefecture.
+  if (/^[A-Za-z]/.test(p)) {
+    const key = p.toLowerCase().replace(/[\s\-]|(ken|fu|prefecture)$/g, '');
+    return PREF_EN_REV[key] || PREF_EN_REV[p.toLowerCase().replace(/[\s\-]/g, '')] || null;
+  }
+  if (/[都道府県]$/.test(p)) return p;
+  if (p === '東京') return '東京都';
+  if (p === '大阪') return '大阪府';
+  if (p === '京都') return '京都府';
+  if (p === '北海道') return '北海道';
+  return p + '県';
+}
+
+// pref未指定でcityだけ来た時の解決: cityidx逆引き。1県に定まれば採用、複数なら候補を返す。
+async function ramenResolvePrefFromCity(env, city) {
+  const idx = await env.TOILET_KV.get('ramen:cityidx', 'json');
+  if (!idx) return { error: 'City index is not initialized yet.' };
+  // 完全一致優先 → 「松戸」のような市抜き表記は包含で救済
+  let key = idx[city] ? city : null;
+  if (!key) {
+    const hits = Object.keys(idx).filter((c) => c.includes(city));
+    if (hits.length > 1) return { error: `"${city}" matches multiple municipalities: ${hits.slice(0, 8).join(', ')}. Add the prefecture.` };
+    if (!hits.length) return { error: `No shops found in "${city}". Check the municipality name (e.g. 松戸市, 世田谷区).` };
+    key = hits[0];
+  }
+  const prefs = idx[key];
+  if (prefs.length > 1) return { error: `"${key}" exists in multiple prefectures (${prefs.join(', ')}). Specify pref.` };
+  return { pref: prefs[0], city: key };
+}
+
+async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng, radius, limit, match, chain, chainSub, maxLimit = 50, maxRadius = 5000 }) {
+  // No-auth callers pass a lower maxLimit/maxRadius; over-limit requests are CLAMPED, not rejected.
+  const cap = Math.min(Math.max(Number.parseInt(limit, 10) || Math.min(20, maxLimit), 1), maxLimit);
+  const exact = (match || '').toLowerCase() === 'exact';  // opt-in whole-word q match
+  // Nearby mode: geohash-4 buckets (lite records), 9-cell read covers radius ≤ 5 km.
+  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return { error: 'Invalid lat/lng.', attribution: RAMEN_ATTR };
+    let rad = Number.parseInt(radius, 10);
+    if (!Number.isFinite(rad) || rad <= 0) rad = Math.min(1500, maxRadius);
+    rad = Math.min(rad, maxRadius);
+    const cells = geohashNeighbors(geohashEncode(lat, lng, 4));
+    const gets = await Promise.all(cells.map((c) => env.TOILET_KV.get(`ramen:geo:${c}`, 'json')));
+    let out = [];
+    for (const cell of gets) {
+      if (!cell) continue;
+      for (const s of cell) {
+        const d = haversine(lat, lng, s.lat, s.lng);
+        if (d <= rad) out.push({ ...s, distance_m: Math.round(d) });
+      }
+    }
+    if (keito) out = out.filter((s) => ramenKeitoMatch(s.keito, keito));
+    if (chain) out = out.filter((s) => ramenChainMatch(s.chain, chain));
+    if (chainSub) out = out.filter((s) => (s.chain_sub || '').toLowerCase() === chainSub.toLowerCase());
+    if (status) out = out.filter((s) => (s.status || 'active') === status);
+    if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
+    out.sort((a, b) => a.distance_m - b.distance_m);
+    return {
+      query: { lat, lng, radius_m: rad, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null },
+      count: Math.min(out.length, cap), total_matched: out.length, shops: out.slice(0, cap).map((s) => ({ ...s, keito: s.keito || [] })),
+      note: 'Nearby results are the lite shape (id/name/pref/city/coords/keito/status). Use get_ramen_shop / GET /v1/shops/{id} for the full record.',
+      attribution: RAMEN_ATTR,
+    };
+  }
+  // Nationwide search: q / keito / status with NO location → scan the lite index, so
+  // "is there a ramen shop called X?" works without knowing the prefecture (Japanese or romaji).
+  if (!pref && !city && (q || keito || status || chain || chainSub)) {
+    const all = await env.TOILET_KV.get('ramen:all_lite', 'json');
+    if (all) {
+      let out = all;
+      if (keito) out = out.filter((s) => ramenKeitoMatch(s.keito, keito));
+      if (chain) out = out.filter((s) => ramenChainMatch(s.chain, chain));
+      if (chainSub) out = out.filter((s) => (s.chain_sub || '').toLowerCase() === chainSub.toLowerCase());
+      if (status) out = out.filter((s) => (s.status || 'active') === status);
+      if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
+      return {
+        query: { q: q || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, scope: 'nationwide' },
+        count: Math.min(out.length, cap), total_matched: out.length, shops: out.slice(0, cap).map((s) => ({ ...s, keito: s.keito || [] })),
+        note: 'Nationwide search (lite shape: id/name/name_en/pref/city/status). Use get_ramen_shop / GET /v1/shops/{id} for the full record.',
+        attribution: RAMEN_ATTR,
+      };
+    }
+  }
+  pref = ramenNormalizePref(pref);
+  if (!pref && city) {
+    const r = await ramenResolvePrefFromCity(env, city);
+    if (r.error) return { error: r.error, attribution: RAMEN_ATTR };
+    pref = r.pref;
+    city = r.city;
+  }
+  if (!pref) return { error: 'Provide "pref" (e.g. 東京都/千葉県, or romaji: saitama/tokyo), a "city" (e.g. 松戸市 / kawaguchi), a name via "q" (nationwide), or lat+lng for nearby search.', attribution: RAMEN_ATTR };
+  const arr = await env.TOILET_KV.get(`ramen:pref:${pref}`, 'json');
+  if (!arr) {
+    const meta = await env.TOILET_KV.get('ramen:meta', 'json');
+    return { error: `No data for pref "${pref}". Use the full form (東京都, 大阪府, 北海道, 千葉県…).`, prefs: meta?.prefs || [], attribution: RAMEN_ATTR };
+  }
+  const matched = ramenFilterFull(arr, { city, keito, status, q, exact, chain, chainSub });
+  return {
+    query: { pref, city: city || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null },
+    count: Math.min(matched.length, cap), total_matched: matched.length, shops: matched.slice(0, cap).map(ramenPublicShape),
+    definitions: RAMEN_DEFS, attribution: RAMEN_ATTR,
+  };
+}
+
+// Semantic search: query -> bge-m3 embedding (Workers AI binding) -> Vectorize nearest neighbours.
+// The lite shape (name/name_en/pref/city/keito/status) rides in vector metadata, so a query needs
+// NO KV reads beyond ramen:meta (data_as_of) — the 10MB all_lite parse never touches this path.
+// Vector corpus: one synthetic sentence per shop (name JA+romaji, keito taxonomy phrase JA+EN for
+// classified shops only — never guessed, nearest station JA+romaji, municipality/prefecture JA+EN),
+// built by vibe/build_all_sentences.py and kept fresh by vibe/diff_upsert.py after the monthly sync.
+// Query-intent keywords -> attribute filters (attributes come from official-site
+// enrichment 2026-07; metadata-indexed on Vectorize). Explicit params win over intent.
+const VIBE_RICH_INTENT = [
+  [/あっさり|淡麗|さっぱり|light broth|assari/i, 'assari'],
+  [/こってり|濃厚|ドロ|背脂|rich broth|kotteri|creamy/i, 'kotteri'],
+];
+const VIBE_HOURS_INTENT = [
+  [/深夜|夜中|夜遅|〆|締めの|シメの|late night|midnight/i, 'late_night'],
+  [/朝ラー|朝から|早朝|モーニング|morning|breakfast/i, 'morning'],
+  [/24時間|24h|24 hours/i, '24h'],
+];
+// Indirect scenario words (season / body condition) -> concrete corpus vocabulary.
+// The vector corpus is built from taxonomy phrases (vibe/keito_map.py), so queries like
+// 「汗だくの夏に塩分補給」 share zero tokens with any shop sentence. When a scenario fires we
+// append the exact taxonomy phrases it implies before embedding, and default richness/hours
+// (only if the query didn't state or trigger one already — attr_filter_source stays 'inferred').
+const VIBE_SCENE_EXPAND = [
+  [/汗だく|塩分補給|夏バテ|猛暑|暑い日/, 'shio 塩 clear salt broth ramen', { rich: 'assari' }],
+  [/風邪|胃に優し|優しい味|体に優し|やさしい味/, 'shio 塩 chuka soba 中華そば 淡麗 light clear broth', { rich: 'assari' }],
+  [/温まる|あったまる|寒い夜|真冬|冷えた/, 'miso 味噌 ramen Sapporo-style 札幌ラーメン rich miso tantanmen 担々麺 spicy sesame', {}],
+  [/二日酔い|飲み過ぎ|酔い覚まし/, 'shio 塩 shoyu 醤油 淡麗 light clear broth', { rich: 'assari' }],
+  [/背徳/, 'こってり 濃厚 rich heavy thick broth', { rich: 'kotteri' }],
+];
+// Query-intent -> prefecture filter (same inferred-filter idea as richness/hours).
+// Two tiers, tuned against style-name false positives:
+//   - FULL prefecture names (北海道/〜県/東京都/大阪府/京都府) always signal location.
+//   - Bare stems (東京, 熊本…) and well-known place names (博多, すすきの…) count ONLY when
+//     followed by a location particle (の/で/…) — so「東京豚骨」「熊本ラーメン」「横浜家系」
+//     read as style names and do NOT bind location, while「博多の細麺」「仙台でラーメン」do.
+//   - Region-style keito words (札幌/喜多方/佐野/白河/尾道/旭川) are deliberately absent:
+//     they are taxonomy styles first, so pref inference must never fire on them.
+const VIBE_PREF_FULL = ['北海道', '東京都', '大阪府', '京都府',
+  '青森県', '岩手県', '宮城県', '秋田県', '山形県', '福島県', '茨城県', '栃木県', '群馬県', '埼玉県',
+  '千葉県', '神奈川県', '新潟県', '富山県', '石川県', '福井県', '山梨県', '長野県', '岐阜県', '静岡県',
+  '愛知県', '三重県', '滋賀県', '兵庫県', '奈良県', '和歌山県', '鳥取県', '島根県', '岡山県', '広島県',
+  '山口県', '徳島県', '香川県', '愛媛県', '高知県', '福岡県', '佐賀県', '長崎県', '熊本県', '大分県',
+  '宮崎県', '鹿児島県', '沖縄県'];
+const VIBE_PLACE_TO_PREF = [
+  ['すすきの', '北海道'], ['函館', '北海道'], ['小樽', '北海道'],
+  ['仙台', '宮城県'], ['宇都宮', '栃木県'],
+  ['新宿', '東京都'], ['渋谷', '東京都'], ['池袋', '東京都'], ['銀座', '東京都'],
+  ['上野', '東京都'], ['浅草', '東京都'], ['秋葉原', '東京都'],
+  ['横浜', '神奈川県'], ['川崎', '神奈川県'],
+  ['名古屋', '愛知県'], ['金沢', '石川県'], ['神戸', '兵庫県'],
+  ['博多', '福岡県'], ['天神', '福岡県'], ['小倉', '福岡県'], ['那覇', '沖縄県'],
+];
+const VIBE_PLACE_PARTICLE = '(?:の|で|に|なら|周辺|近辺|あたり|辺り|エリア|市内|駅)';
+function vibeInferPref(q) {
+  for (const full of VIBE_PREF_FULL) if (q.includes(full)) return full;
+  for (const [place, pref] of VIBE_PLACE_TO_PREF) {
+    if (new RegExp(place + VIBE_PLACE_PARTICLE).test(q)) return pref;
+  }
+  for (const full of VIBE_PREF_FULL) {
+    if (full === '北海道') continue;
+    const stem = full.replace(/[都府県]$/, '');
+    // 京都 stem must not fire inside 東京都/東京 — negative lookbehind on 東.
+    const re = stem === '京都' ? new RegExp('(?<!東)京都' + VIBE_PLACE_PARTICLE) : new RegExp(stem + VIBE_PLACE_PARTICLE);
+    if (re.test(q)) return full;
+  }
+  return null;
+}
+
+
+async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, hours }) {
+  if (!q) return { error: 'Provide q — a natural-language description, e.g. "rich creamy pork bone broth" / "あっさり淡麗な醤油".', attribution: RAMEN_ATTR };
+  if (!env.AI || !env.VECTORIZE) return { error: 'Semantic search is not available on this deployment.', attribution: RAMEN_ATTR };
+  const cap = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 20);
+  const st = (status || 'active').toLowerCase();
+  if (!['active', 'closed_confirmed', 'all'].includes(st)) {
+    return { error: 'status must be active (default), closed_confirmed or all.', attribution: RAMEN_ATTR };
+  }
+  const filter = {};
+  const explicitPref = Boolean(pref);
+  if (pref) {
+    const np = ramenNormalizePref(pref);
+    if (!np) return { error: `Unknown prefecture "${pref}". Use 東京都/千葉県… or romaji (tokyo/osaka).`, attribution: RAMEN_ATTR };
+    filter.pref = np;
+  } else {
+    const ip = vibeInferPref(q);
+    if (ip) filter.pref = ip;
+  }
+  const inferredPref = !explicitPref && Boolean(filter.pref);
+  if (st !== 'all') filter.status = st;
+  // attribute filters: explicit params win; otherwise infer intent from the query text.
+  const RICH_VALUES = ['assari', 'kotteri', 'futsu', 'menu_varies'];
+  const HOURS_VALUES = ['morning', 'late_night', '24h'];
+  let rich = (richness || '').toLowerCase() || null;
+  let hrs = (hours || '').toLowerCase() || null;
+  if (rich && !RICH_VALUES.includes(rich)) return { error: `richness must be one of ${RICH_VALUES.join('/')}.`, attribution: RAMEN_ATTR };
+  if (hrs && !HOURS_VALUES.includes(hrs)) return { error: `hours must be one of ${HOURS_VALUES.join('/')}.`, attribution: RAMEN_ATTR };
+  const explicit = Boolean(rich || hrs);
+  if (!rich) { for (const [rx, v] of VIBE_RICH_INTENT) if (rx.test(q)) { rich = v; break; } }
+  if (!hrs) { for (const [rx, v] of VIBE_HOURS_INTENT) if (rx.test(q)) { hrs = v; break; } }
+  let embedText = String(q).slice(0, 300);
+  let sceneTerms = null;
+  for (const [rx, terms, d] of VIBE_SCENE_EXPAND) {
+    if (rx.test(q)) {
+      sceneTerms = terms;
+      if (!rich && d.rich) rich = d.rich;
+      if (!hrs && d.hours) hrs = d.hours;
+      embedText = `${embedText} ${terms}`;
+      break;
+    }
+  }
+  const attrFilter = {};
+  if (rich) attrFilter.richness = rich;
+  if (hrs) attrFilter.hours = hrs;
+  let vector;
+  try {
+    const emb = await env.AI.run('@cf/baai/bge-m3', { text: [embedText] });
+    vector = emb && emb.data && emb.data[0];
+  } catch (e) { /* fall through to the error below */ }
+  if (!vector) return { error: 'Query embedding failed — please retry.', attribution: RAMEN_ATTR };
+  const toShop = (m, attrMatched) => {
+    const md = m.metadata || {};
+    return {
+      id: m.id, name: md.name, name_en: md.name_en || null,
+      pref: md.pref, city: md.city,
+      keito: md.keito ? String(md.keito).split(',') : [],
+      ...(md.richness ? { richness: md.richness } : {}),
+      ...(md.hours ? { hours_class: String(md.hours).split(',') } : {}),
+      status: md.status || 'active',
+      ...(attrMatched != null ? { attr_matched: attrMatched } : {}),
+      similarity: Math.round(m.score * 10000) / 10000,
+    };
+  };
+  // blend fallback keeps only what the caller stated explicitly (drops inferred pref/attrs),
+  // so a wrong inference can narrow the top results but never empty them.
+  const fallbackFilter = { ...filter };
+  if (inferredPref) delete fallbackFilter.pref;
+  let shops;
+  if (Object.keys(attrFilter).length) {
+    // attribute-aware path: verified-attribute shops first; if the pool is thin and
+    // a filter was only INFERRED, blend in plain semantic matches after them.
+    const resA = await env.VECTORIZE.query(vector, {
+      topK: cap, returnValues: false, returnMetadata: 'all',
+      filter: { ...filter, ...attrFilter },
+    });
+    shops = (resA && resA.matches ? resA.matches : []).map((m) => toShop(m, true));
+    if ((!explicit || inferredPref) && shops.length < cap) {
+      const bf = { ...fallbackFilter, ...(explicit ? attrFilter : {}) };
+      const resB = await env.VECTORIZE.query(vector, {
+        topK: cap, returnValues: false, returnMetadata: 'all',
+        ...(Object.keys(bf).length ? { filter: bf } : {}),
+      });
+      const seen = new Set(shops.map((s2) => s2.id));
+      for (const m of (resB && resB.matches ? resB.matches : [])) {
+        if (seen.has(m.id) || shops.length >= cap) continue;
+        shops.push(toShop(m, explicit ? true : false));
+      }
+    }
+  } else {
+    const res = await env.VECTORIZE.query(vector, {
+      topK: cap, returnValues: false, returnMetadata: 'all',
+      ...(Object.keys(filter).length ? { filter } : {}),
+    });
+    shops = (res && res.matches ? res.matches : []).map((m) => toShop(m, null));
+    if (inferredPref && shops.length < cap) {
+      const resB = await env.VECTORIZE.query(vector, {
+        topK: cap, returnValues: false, returnMetadata: 'all',
+        ...(Object.keys(fallbackFilter).length ? { filter: fallbackFilter } : {}),
+      });
+      const seen = new Set(shops.map((s2) => s2.id));
+      for (const m of (resB && resB.matches ? resB.matches : [])) {
+        if (seen.has(m.id) || shops.length >= cap) continue;
+        shops.push(toShop(m, null));
+      }
+    }
+  }
+  return {
+    query: { q, pref: filter.pref || null, status: st, semantic: true,
+             ...(filter.pref ? { pref_source: explicitPref ? 'param' : 'inferred' } : {}),
+             ...(sceneTerms ? { scene_expansion: sceneTerms } : {}),
+             ...(rich ? { richness: rich } : {}), ...(hrs ? { hours: hrs } : {}),
+             ...(Object.keys(attrFilter).length ? { attr_filter_source: explicit ? 'param' : 'inferred' } : {}) },
+    count: shops.length, shops,
+    note: 'Semantic matches, best first (lite shape + similarity 0–1). Use get_ramen_shop / GET /v1/shops/{id} for the full record; use search_ramen for exact name/keito/geo filters.',
+    attribution: RAMEN_ATTR,
+  };
+}
+
+// ---- station_search: semantic station discovery + hybrid metadata filters -----------------------
+// Index gachi-station-vibe: one bge-m3 sentence per physical station (9,035 clusters from the Japan
+// Station Master), carrying lines/terminal size, ramen density BAND words (never exact counts — so
+// monthly count drift doesn't force re-embeds), in-station accessible-toilet equipment, official
+// hazard categories and ridership. Built by vibe/station_sentences.py + vibe/station_upsert.py.
+// Design validated in the S3 Vectors lab (2026-07): pure vector ranking is fuzzy on conjunctive
+// constraints — the metadata filter GUARANTEES the constraint, the embedding ranks by fit.
+const STATION_ATTR = {
+  sources: [
+    'Station master & lines — Japan Station Master (gachi-open-datasets, CC BY 4.0; ODPT/Wikidata-derived)',
+    'Ramen stats — gachi-tokusuru.com ramen DB (monthly re-verified)',
+    'In-station accessible-toilet stats — Tokyo Metropolitan Bureau of Social Welfare (CC BY 4.0), Tokyo stations only',
+    'Ridership — ODPT PassengerSurvey (Greater Tokyo operators only)',
+    'Hazard — 国土交通省 不動産情報ライブラリ official categories (point lookup at the station, relayed as-is)',
+  ],
+  provider: 'https://api.gachi-tokusuru.com',
+};
+const STATION_SEARCH_NOTES = [
+  'toilet stats cover Tokyo stations only (missing ≠ no toilets)',
+  'ridership covers Greater Tokyo operators only',
+  'hazard fields are official MLIT categories relayed as-is — not a safety judgment',
+];
+
+// 駅検索専用のpref推論: 共通のvibeInferPref(助詞必須)に加え、「〜駅 埼玉」のような
+// 末尾/区切りの裸の都道府県名も拾う(検索クエリの定型)。ramen側の挙動には影響させない。
+function stationInferPref(q) {
+  const p = vibeInferPref(q);
+  if (p) return p;
+  for (const full of VIBE_PREF_FULL) {
+    if (full === '北海道') continue; // 全名はvibeInferPrefのincludesで既に拾済み
+    const stem = full.replace(/[都府県]$/, '');
+    const re = stem === '京都' ? /(?<!東)京都(?=\s|$|、|。)/ : new RegExp(stem + '(?=\\s|$|、|。)');
+    if (re.test(q)) return full;
+  }
+  return null;
+}
+
+// 品質・味の語は評価しない(レビューデータ無し)ことの正直な宣言に使う検知。
+const STATION_TASTE_WORDS = /うまい|旨い|美味い|美味しい|おいしい|絶品|名店|delicious|tasty|good\s+(food|ramen|eats)|best\s+(food|ramen)/i;
+
+// ---- ハザード意図辞書(複合展開) ----
+// 低リスク方向の言い回し: ない/なし/低い/避けたい/安心/安全/少ない/心配(がない)/不安/〜に強い 等。
+// 高リスク値の定義(risk_notes用・公式区分の中継のみ):
+//   flood_rank>=3 = 浸水想定3.0m以上 / liq_level 1-2 = 非常に液状化しやすい・液状化しやすい / storm_surge = 高潮浸水想定区域内
+const HAZ_LOWRISK_WORDS = /ない|なし|低|避け|安心|安全|少な|心配|不安|強い|良い|いい|しにくい|しづらい|free|low|safe|avoid|without|resistant/i;
+const HAZ_FLOOD_WORDS = /洪水|水害|浸水|高潮|flood|storm surge|inundation/i;
+const HAZ_LIQ_WORDS = /液状化|地盤|liquefaction|\bground\b/i; // \b: undergroundに部分一致させない
+const HAZ_BROAD_WORDS = /災害|ハザード|disaster|hazard/i;
+function stationRiskNotes(md) {
+  const notes = [];
+  if ((md.flood_rank ?? 0) >= 3) notes.push(`flood: ${md.flood_ja || `rank ${md.flood_rank}`}（浸水想定3.0m以上）`);
+  if (md.liq_level >= 1 && md.liq_level <= 2 && md.liq_note) notes.push(`liquefaction: ${md.liq_note}`);
+  if (md.storm_surge) notes.push('storm_surge: 高潮浸水想定区域内');
+  return notes;
+}
+
+async function stationSearchPayload(env, a) {
+  const q = (a.q || '').trim();
+  if (!q) return { error: 'Provide q — describe the station/area you want, e.g. "朝ラーメンが食べられて車椅子トイレがある駅" / "terminal with late-night ramen".', attribution: STATION_ATTR };
+  if (!env.AI || !env.VECTORIZE_STATION) return { error: 'Station search is not available on this deployment.', attribution: STATION_ATTR };
+  const cap = Math.min(Math.max(Number.parseInt(a.limit, 10) || 10, 1), 20);
+  // explicit filters (params) — these always survive the blend fallback
+  const explicitFilter = {};
+  if (a.pref) {
+    const np = ramenNormalizePref(a.pref);
+    if (!np) return { error: `Unknown prefecture "${a.pref}". Use 東京都/千葉県… or romaji (tokyo/osaka).`, attribution: STATION_ATTR };
+    explicitFilter.pref = np;
+  }
+  if (a.morning_ramen === true) explicitFilter.has_morning_ramen = true;
+  if (a.late_ramen === true) explicitFilter.has_late_ramen = true;
+  if (a.diaper === true) explicitFilter.has_diaper = true;
+  const nMin = Number(a.ramen_min);
+  if (Number.isFinite(nMin) && nMin > 0) explicitFilter.ramen_count = { $gte: nMin };
+  const tMin = Number(a.accessible_toilet_min);
+  if (Number.isFinite(tMin) && tMin > 0) explicitFilter.acc_toilet_count = { $gte: tMin };
+  const fMax = Number(a.flood_rank_max);
+  if (a.flood_rank_max !== undefined && Number.isFinite(fMax)) explicitFilter.flood_rank = { $lte: Math.max(0, Math.min(6, fMax)) };
+  // inferred filters (query-text intent) — dropped by the blend fallback if the pool runs thin
+  const filter = { ...explicitFilter };
+  const inferred = [];
+  if (!('pref' in explicitFilter)) {
+    const ip = stationInferPref(q);
+    if (ip) { filter.pref = ip; inferred.push(`pref=${ip}`); }
+  }
+  if (a.morning_ramen === undefined && /朝ラー|朝から|早朝|モーニング|morning|breakfast/i.test(q)) { filter.has_morning_ramen = true; inferred.push('morning_ramen'); }
+  if (a.late_ramen === undefined && /深夜|夜中|夜遅|〆|締めの|シメの|late night|midnight/i.test(q)) { filter.has_late_ramen = true; inferred.push('late_ramen'); }
+  // 設備系(トイレ設備)のinferredフィルタはSOFT: データが東京都限定のため、hard除外だと
+  // 46道府県がデータ欠損だけで黙って消える。確認済み駅をブースト・unknownは降格で残す。
+  // 明示パラメータ(a.diaper===true等)は従来どおりhard(上のexplicitFilterで処理済み)。
+  const softFilters = [];
+  if (a.diaper === undefined && /おむつ|オムツ|diaper|子連れ|赤ちゃん|ベビー|子育て/i.test(q)) {
+    softFilters.push({ filter: 'diaper', test: (md) => Boolean(md.has_diaper), coverage: 'toilet equipment data covers Tokyo stations only' });
+  }
+  if (a.accessible_toilet_min === undefined && /車椅子|車いす|バリアフリー|wheelchair|accessible/i.test(q)) {
+    softFilters.push({ filter: 'accessible_toilet', test: (md) => (md.acc_toilet_count ?? 0) >= 1, coverage: 'in-station accessible-toilet data covers Tokyo stations only' });
+  }
+  // ハザード系のinferredフィルタはHARD維持(公式データが全国カバレッジで欠損問題がないため)。
+  // 水害系の語は flood_rank だけでなく高潮(storm_surge)も複合で展開する — 高潮浸水想定区域の
+  // 埋立地駅が「水害リスク低い」に混入しないように。広域語(災害/hazard)は3要素すべて。
+  const wantsLowRisk = HAZ_LOWRISK_WORDS.test(q);
+  if (a.flood_rank_max === undefined && wantsLowRisk && (HAZ_FLOOD_WORDS.test(q) || HAZ_BROAD_WORDS.test(q))) {
+    filter.flood_rank = { $lte: 0 };
+    filter.storm_surge = false;
+    inferred.push('flood_rank_max=0', 'storm_surge=false');
+  }
+  if (wantsLowRisk && (HAZ_LIQ_WORDS.test(q) || HAZ_BROAD_WORDS.test(q))) {
+    filter.liq_level = { $gte: 4 };
+    inferred.push('liq_level_min=4 (公式区分: 4=やや液状化しにくい, 5=液状化しにくい)');
+  }
+  // 品質・味の語は評価できない(レビューデータ無し)。暗黙にkeito多様性等へ寄せ替えない — noteで正直に宣言。
+  const tasteNote = STATION_TASTE_WORDS.test(q)
+    ? "Taste/quality words ('うまい', 'delicious'…) are not evaluated — this dataset has no review/rating data. Ramen-related ranking reflects shop density and style variety only."
+    : null;
+  let vector;
+  try {
+    const emb = await env.AI.run('@cf/baai/bge-m3', { text: [q.slice(0, 300)] });
+    vector = emb && emb.data && emb.data[0];
+  } catch (e) { /* fall through */ }
+  if (!vector) return { error: 'Query embedding failed — please retry.', attribution: STATION_ATTR };
+  const toStation = (m) => {
+    const md = m.metadata || {};
+    const riskNotes = stationRiskNotes(md); // フィルタ通過後も高リスク要素は沈黙させない(公式区分の中継のみ)
+    return {
+      station_id: m.id, name: md.name || null, name_ja: md.name_ja || null, pref: md.pref || null,
+      similarity: Math.round(m.score * 10000) / 10000,
+      ramen: { count: md.ramen_count ?? 0, keito_top: md.keito_top ? String(md.keito_top).split(',') : [],
+               morning: Boolean(md.has_morning_ramen), late_night: Boolean(md.has_late_ramen) },
+      toilet: { accessible_count: md.acc_toilet_count ?? 0, diaper: Boolean(md.has_diaper), baby_chair: Boolean(md.has_baby_chair) },
+      hazard: { flood_rank: md.flood_rank ?? 0, flood_category_ja: md.flood_ja || 'なし',
+                ...(md.rivers ? { rivers: String(md.rivers).split(', ') } : {}),
+                liquefaction_note_ja: md.liq_note || null, storm_surge_zone: Boolean(md.storm_surge) },
+      ...(riskNotes.length ? { risk_notes: riskNotes } : {}),
+      lines: md.line_count ?? 0,
+      ...(md.ridership_latest ? { ridership_latest: md.ridership_latest } : {}),
+      ...(md.lat ? { lat: md.lat, lng: md.lng } : {}),
+    };
+  };
+  // softフィルタあり: プールを最大まで取り、確認済み駅を先頭にブースト(similarity順は各層内で維持)。
+  const topK = softFilters.length ? 20 : cap; // 20 = Vectorize returnMetadata:'all' の上限
+  const res = await env.VECTORIZE_STATION.query(vector, {
+    topK, returnValues: false, returnMetadata: 'all',
+    ...(Object.keys(filter).length ? { filter } : {}),
+  });
+  let matches = res && res.matches ? res.matches : [];
+  if (softFilters.length) {
+    const softOK = (m) => softFilters.every((sf) => sf.test(m.metadata || {}));
+    matches = [...matches.filter(softOK), ...matches.filter((m) => !softOK(m))];
+  }
+  let stations = matches.slice(0, cap).map((m) => {
+    const s = toStation(m);
+    if (softFilters.length) s.soft_matched = softFilters.every((sf) => sf.test(m.metadata || {}));
+    return s;
+  });
+  // blend fallback: a wrong INFERRED filter may narrow results but must never empty them.
+  if (inferred.length && stations.length < cap) {
+    const resB = await env.VECTORIZE_STATION.query(vector, {
+      topK: cap, returnValues: false, returnMetadata: 'all',
+      ...(Object.keys(explicitFilter).length ? { filter: explicitFilter } : {}),
+    });
+    const seen = new Set(stations.map((s2) => s2.station_id));
+    for (const m of (resB && resB.matches ? resB.matches : [])) {
+      if (seen.has(m.id) || stations.length >= cap) continue;
+      stations.push({ ...toStation(m), filter_matched: false });
+    }
+  }
+  const meta = await env.TOILET_KV.get('ramen:meta', 'json').catch(() => null);
+  const explicitCount = Object.keys(explicitFilter).length;
+  return {
+    query: q, count: stations.length,
+    applied_filters: filter,
+    ...(softFilters.length ? {
+      soft_filters: softFilters.map((sf) => ({
+        filter: sf.filter,
+        mode: 'boost — confirmed stations ranked first; unknown/missing data demoted, not excluded',
+        coverage: sf.coverage,
+      })),
+    } : {}),
+    filter_source: inferred.length && explicitCount ? 'explicit+inferred' : inferred.length ? 'inferred' : explicitCount ? 'explicit' : 'none',
+    stations,
+    ...(tasteNote ? { note: tasteNote } : {}),
+    notes: STATION_SEARCH_NOTES,
+    ...(meta && meta.data_as_of ? { stats_as_of: meta.data_as_of } : {}),
+    disclaimer: HAZARD_DISCLAIMER,
+    attribution: STATION_ATTR,
+  };
+}
+
+async function ramenShopPayload(env, id) {
+  const idx = await env.TOILET_KV.get('ramen:ididx', 'json');
+  let pref = idx ? idx[id] : null;
+  let mergedInto = null;
+  if (!pref) {
+    // 統合済み旧ID: rk_はstable IDとして公開しているので404にせず正レコードへ解決(merged_into付き)。
+    const aliases = await env.TOILET_KV.get('ramen:aliases', 'json').catch(() => null);
+    const canon = aliases ? aliases[id] : null;
+    if (!canon) return null;
+    mergedInto = canon;
+    pref = idx ? idx[canon] : null;
+    if (!pref) return null;
+    id = canon;
+  }
+  const arr = (await env.TOILET_KV.get(`ramen:pref:${pref}`, 'json')) || [];
+  const shop = arr.find((s) => s.id === id);
+  if (!shop) return null;
+  const payload = { shop: ramenPublicShape(shop), definitions: RAMEN_DEFS, attribution: RAMEN_ATTR };
+  if (mergedInto) {
+    payload.merged_into = mergedInto;
+    payload.note = `The requested id was merged into ${mergedInto} (duplicate-record consolidation 2026-07-31); returning the canonical record.`;
+  }
+  return payload;
+}
+
+async function ramenShopByName(env, name, pref, city) {
+  pref = ramenNormalizePref(pref);
+  if (!pref && city) {
+    const r = await ramenResolvePrefFromCity(env, city);
+    if (r.error) return { error: r.error, attribution: RAMEN_ATTR };
+    pref = r.pref;
+    city = r.city;
+  }
+  if (!pref) return { error: 'pref (e.g. 千葉県) or city (e.g. 松戸市) is required with name.', attribution: RAMEN_ATTR };
+  let arr = await env.TOILET_KV.get(`ramen:pref:${pref}`, 'json');
+  if (!arr) return { error: `No data for pref "${pref}".`, attribution: RAMEN_ATTR };
+  if (city) arr = arr.filter((s) => (s.city || '').includes(city));
+  const exact = arr.filter((s) => s.name === name);
+  const partial = exact.length ? exact : arr.filter((s) => (s.name || '').includes(name));
+  if (!partial.length) return { error: `No shop matched "${name}" in ${city || pref}.`, attribution: RAMEN_ATTR };
+  return {
+    shop: ramenPublicShape(partial[0]),
+    other_matches: partial.slice(1, 10).map((s) => ({ id: s.id, name: s.name, city: s.city })),
+    definitions: RAMEN_DEFS, attribution: RAMEN_ATTR,
+  };
+}
+
+async function ramenChangesPayload(env, since, { maxEvents = 500, minDate = null } = {}) {
+  const c = await env.TOILET_KV.get('ramen:changes', 'json');
+  if (!c) return { error: 'Ramen changes feed is not initialized yet.', attribution: RAMEN_ATTR };
+  let events = c.events || [];
+  if (since) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return { error: 'since must be YYYY-MM-DD.', attribution: RAMEN_ATTR };
+    events = events.filter((e) => e.date >= since);
+  }
+  // No-auth: floor to a recent window so the full changes feed (a Pro deliverable) can't be bulk-pulled.
+  if (minDate) events = events.filter((e) => e.date >= minDate);
+  const sliced = events.slice(0, maxEvents);
+  const r = {
+    dataset: 'ramen', generated_at: c.generated_at || null, since: since || null,
+    count: minDate ? sliced.length : events.length, events: sliced,
+    definitions: RAMEN_DEFS, attribution: RAMEN_ATTR,
+  };
+  if (minDate) r.window = `No-auth preview: last 7 days, up to ${maxEvents} events. The full changes feed (all history) needs a key: ${RAMEN_UPGRADE_URL}`;
+  return r;
+}
+
+// Dataset-level freshness date (ramen:meta.data_as_of). Attached to every ramen response so callers
+// have an HONEST freshness signal without over-reading per-shop last_seen (which for active shops is
+// just this same build date). null if meta not seeded.
+async function ramenDataAsOf(env) {
+  const m = await env.TOILET_KV.get('ramen:meta', 'json');
+  return (m && m.data_as_of) || null;
+}
+
+// ---- ping payloads (freshness self-proof, read live from KV) -------------------------------------
+// Unobtainable fields are OMITTED (not null) so the health check never lies about what it can prove.
+async function pingRamenPayload(env) {
+  const m = await env.TOILET_KV.get('ramen:meta', 'json');
+  const active = m && m.status_counts && typeof m.status_counts.active === 'number' ? m.status_counts.active : null;
+  const asOf = (m && m.data_as_of) || null;
+  const p = { status: 'ok', server: 'Gachi-Ramen', version: BUILD_VERSION.commit };
+  if (active != null) p.shops_active = active;         // ramen:meta.status_counts.active — live, not hardcoded
+  if (asOf) p.last_weekly_crawl = asOf;                 // ramen:meta.data_as_of — latest dataset refresh date
+  p.coverage = 'all 47 prefectures';
+  p.rate_limit_noauth = '60 req/min per IP';
+  return p;
+}
+async function pingApiPayload(env, toolCount) {
+  const a = await readRealtime(env, 'alerts:active', ALERTS_MAX_AGE_S);
+  const t = await readRealtime(env, 'train:status:_all', TRAIN_MAX_AGE_S);
+  const realtime = {};
+  if (a.fetched_at) realtime.jma_alerts_updated = a.fetched_at;
+  if (t.fetched_at) realtime.train_status_updated = t.fetched_at;
+  const p = {
+    status: 'ok', server: 'Tokyo Restroom Finder (Gachi-DB)', version: BUILD_VERSION.commit,
+    tools: toolCount, stations_covered: STATIONS_COVERED,
+  };
+  if (Object.keys(realtime).length) p.realtime_layers = realtime;
+  p.rate_limit_noauth = '60 req/min per IP';
+  return p;
+}
+function withRamenDataAsOf(payload, dataAsOf) {
+  if (payload && typeof payload === 'object' && !payload.error && dataAsOf) payload.data_as_of = dataAsOf;
+  return payload;
+}
+
 // Auth + shared metering for REST (same key + same monthly counter as MCP).
-async function restAuthAndMeter(request, env) {
+async function restAuthAndMeter(request, env, opts = {}) {
   const auth = await resolveAuth(request, env);
   if (!auth.ok) {
     return { error: restError('unauthorized', `Missing or invalid API key. Get a free key at ${UPGRADE_URL}`, 401) };
   }
-  const m = await meterUsage(env, auth.token, auth.plan);
+  // Ramen product is entitlement-gated: a general Gachi Data API key must never reach it.
+  if (opts.ramenOnly && auth.product !== 'ramen' && auth.product !== 'all') {
+    return { error: restError('forbidden', 'This API key is not valid for the Ramen API. Get a ramen key at https://ramen.gachi-tokusuru.com', 403) };
+  }
+  const bl = await keyedBurstLimit(env, auth);
+  if (!bl.ok) {
+    return { error: restError('rate_limit_exceeded', `Rate limit exceeded (${bl.rps} req/s on ${auth.plan}). Slow the request rate — your monthly quota is unaffected.`, 429, { 'retry-after': '1' }) };
+  }
+  const m = await meterUsageFor(env, auth);
   if (!m.allowed) {
+    const period = m.daily ? 'Daily' : 'Monthly';
+    const suffix = m.daily ? `resets at 00:00 UTC — upgrade to Pro for unlimited: ${RAMEN_UPGRADE_URL}` : `Upgrade: ${UPGRADE_URL}`;
     return {
       error: restError(
         'rate_limit_exceeded',
-        `Monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade: ${UPGRADE_URL}`,
+        `${period} limit reached (${m.used}/${m.limit} on ${auth.plan}). ${suffix}`,
         429,
         { 'retry-after': '3600' },
       ),
     };
   }
   return { ok: true, auth };
+}
+
+// Ramen REST gate. Mirrors the MCP ramen policy so REST has the same open front door: a VALID ramen
+// key gets full metered access (plan burst + monthly quota); no/invalid/expired key falls to the
+// no-auth path — IP rate-limited (60/min) and served with the same reduced caps as MCP no-auth
+// (search limit 20, nearby radius 2,000 m, changes last 7 days ≤50), across all 47 prefectures.
+// The $500 Pro moat is full volume + the full change-history feed + higher limits, not REST access.
+async function ramenRestGate(request, env, ctx) {
+  const auth = await resolveAuth(request, env);
+  if (auth.ok) {
+    // A valid key for a different product must never reach the ramen data.
+    if (auth.product !== 'ramen' && auth.product !== 'all') {
+      return { error: restError('forbidden', 'This API key is not valid for the Ramen API. Get a ramen key at https://ramen.gachi-tokusuru.com', 403) };
+    }
+    const bl = await keyedBurstLimit(env, auth);
+    if (!bl.ok) {
+      return { error: restError('rate_limit_exceeded', `Rate limit exceeded (${bl.rps} req/s on ${auth.plan}). Slow the request rate — your monthly quota is unaffected.`, 429, { 'retry-after': '1' }) };
+    }
+    const m = await meterUsageFor(env, auth);
+    if (!m.allowed) {
+      const period = m.daily ? 'Daily' : 'Monthly';
+      const suffix = m.daily ? `resets at 00:00 UTC — upgrade to Pro for unlimited: ${RAMEN_UPGRADE_URL}` : `Upgrade: ${UPGRADE_URL}`;
+      return { error: restError('rate_limit_exceeded', `${period} limit reached (${m.used}/${m.limit} on ${auth.plan}). ${suffix}`, 429, { 'retry-after': '3600' }) };
+    }
+    return { ok: true, auth, noauth: false };
+  }
+  // No/invalid/expired key: serve the clamped no-auth path (same as MCP), IP rate-limited.
+  const rl = await noauthCallLimit(env, request);
+  if (!rl.ok) {
+    return { error: restError('rate_limit_exceeded', 'Rate limit exceeded (60 requests/minute per IP). Slow down, or get a free key for higher, metered limits: ' + UPGRADE_URL, 429, { 'retry-after': '60' }) };
+  }
+  bumpNoauthStat(env, ctx, 'rest');
+  return { ok: true, noauth: true };
 }
 
 // ============ Municipality Context API (Akiya Stage 2) ============
@@ -1116,6 +2556,8 @@ function parseCtxFields(raw) {
 async function ctxAuthAndGate(request, env) {
   const auth = await resolveAuth(request, env);
   if (!auth.ok) return { error: restError('unauthorized', `Missing or invalid API key. Get a free key at ${UPGRADE_URL}`, 401) };
+  const bl = await keyedBurstLimit(env, auth);
+  if (!bl.ok) return { error: restError('rate_limit_exceeded', `Rate limit exceeded (${bl.rps} req/s on ${auth.plan}). Slow the request rate — your monthly quota is unaffected.`, 429, { 'retry-after': '1' }) };
   if (auth.plan === 'free') {
     const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const k = `ctxday:${auth.token}:${day}`;
@@ -1166,6 +2608,8 @@ async function stationContextPayload(env, stationRef, fields) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    // ramen.gachi-tokusuru.com is the standalone ramen product; api.* is the full data API.
+    const isRamen = url.hostname === RAMEN_HOST;
 
     // CORS preflight for the REST API
     if (request.method === 'OPTIONS' && url.pathname.startsWith('/v1/')) {
@@ -1180,9 +2624,16 @@ export default {
       );
     }
 
+    // Server icon (referenced from initialize serverInfo.icon; also usable as a favicon).
+    if (request.method === 'GET' && (url.pathname === '/icon.svg' || url.pathname === '/favicon.svg')) {
+      return new Response(isRamen ? RAMEN_ICON_SVG : API_ICON_SVG, {
+        headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'public, max-age=86400', ...CORS },
+      });
+    }
+
     // ---- OAuth 2.1 (remote MCP auth; enables claude.ai web / Desktop connectors) ----
     if (request.method === 'GET' && (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp')) {
-      return Response.json(protectedResourceMetadata(), { headers: { ...CORS, 'cache-control': 'public, max-age=3600' } });
+      return Response.json(protectedResourceMetadata(isRamen), { headers: { ...CORS, 'cache-control': 'public, max-age=3600' } });
     }
     if (request.method === 'GET' && (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/oauth-authorization-server/mcp')) {
       return Response.json(authServerMetadata(), { headers: { ...CORS, 'cache-control': 'public, max-age=3600' } });
@@ -1245,7 +2696,11 @@ export default {
         if (csecret && (!client || client.client_secret !== csecret)) return oauthTokenErr('invalid_client', 'Invalid client_secret.');
         const verifier = form.get('code_verifier') || '';
         if (!verifier || (await sha256b64url(verifier)) !== rec.code_challenge) return oauthTokenErr('invalid_grant', 'PKCE verification failed.');
-        const accessToken = await issueFreeKey(env, 'oauth:' + (rec.client_id || 'connector'));
+        // Scope the OAuth key to the product the client asked for (RFC 8707 resource indicator).
+        // Both products issue a standard Free key — nationwide, no trial. (The retired ramen trial
+        // gated 3 prefectures; that gate is gone, so an OAuth connection is a plain Free connection.)
+        const ramenScoped = typeof rec.resource === 'string' && rec.resource.includes(RAMEN_HOST);
+        const accessToken = await issueFreeKey(env, 'oauth:' + (rec.client_id || 'connector'), ramenScoped ? 'ramen' : 'gachi');
         const refreshToken = randToken('rt_');
         await env.TOILET_KV.put(`oauthrefresh:${refreshToken}`, JSON.stringify({ key: accessToken, client_id: rec.client_id }), { expirationTtl: 34560000 });
         return Response.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 2592000, refresh_token: refreshToken, scope: rec.scope || OAUTH_SCOPE }, { headers: { ...CORS, 'cache-control': 'no-store' } });
@@ -1307,7 +2762,8 @@ export default {
       const tool = TOOLS.find((t) => t.name === 'get_toilet_by_station');
       const found = await lookup(env, tool.prefix, station);
       if (!found) return restError('not_found', `No station toilet data for "${station}".`, 404);
-      return restJson({ ...(await toEnglishStation(env, found)), attribution: tool.attribution });
+      const stAttr = found.layer === 'in_station_gate' ? EKINAI_ATTR : tool.attribution;
+      return restJson({ ...(await toEnglishStation(env, found)), attribution: stAttr });
     }
 
     if (request.method === 'GET' && url.pathname === '/v1/toilets/nearby') {
@@ -1420,12 +2876,66 @@ export default {
       });
     }
 
+    // ---- Ramen DB (nationwide ramen shops with monthly freshness) ----
+    // Ramen REST is scoped to the standalone product host only — not reachable via the general API.
+    if (isRamen && request.method === 'GET' && url.pathname === '/v1/shops') {
+      const gate = await ramenRestGate(request, env, ctx);
+      if (gate.error) return gate.error;
+      const near = (url.searchParams.get('near') || '').split(',');
+      const lat = parseFloat(url.searchParams.get('lat') ?? near[0]);
+      const lng = parseFloat(url.searchParams.get('lng') ?? near[1]);
+      const payload = await ramenSearchPayload(env, {
+        pref: (url.searchParams.get('pref') || '').trim() || null,
+        city: (url.searchParams.get('city') || '').trim() || null,
+        keito: (url.searchParams.get('keito') || '').trim() || null,
+        status: (url.searchParams.get('status') || '').trim() || null,
+        q: (url.searchParams.get('q') || '').trim() || null,
+        chain: (url.searchParams.get('chain') || '').trim() || null,
+        chainSub: (url.searchParams.get('chain_sub') || '').trim() || null,
+        match: (url.searchParams.get('match') || '').trim() || null,
+        lat, lng, radius: url.searchParams.get('radius'), limit: url.searchParams.get('limit'),
+        // No-auth: all 47 prefectures, but limit capped 20 and nearby radius capped 2,000 m (clamped).
+        ...(gate.noauth ? { maxLimit: 20, maxRadius: 2000 } : {}),
+      });
+      if (payload.error) return restError('bad_request', payload.error, 400);
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return restJson(payload);
+    }
+    if (isRamen && request.method === 'GET' && (url.pathname === '/v1/shops/changes' || url.pathname === '/v1/changes')) {
+      const gate = await ramenRestGate(request, env, ctx);
+      if (gate.error) return gate.error;
+      // No-auth: cap to the last 7 days and ≤50 events so the full changes feed (a Pro deliverable) can't be bulk-pulled.
+      const changeOpts = gate.noauth
+        ? { maxEvents: 50, minDate: new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10) }
+        : {};
+      const payload = await ramenChangesPayload(env, (url.searchParams.get('since') || '').trim() || null, changeOpts);
+      if (payload.error) {
+        return payload.error.includes('since') ? restError('bad_request', payload.error, 400)
+          : restError('unavailable', payload.error, 503);
+      }
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return restJson(payload);
+    }
+    const shopMatch = url.pathname.match(/^\/v1\/shops\/(rk_\d+)$/);
+    if (isRamen && request.method === 'GET' && shopMatch) {
+      const gate = await ramenRestGate(request, env, ctx);
+      if (gate.error) return gate.error;
+      const payload = await ramenShopPayload(env, shopMatch[1]);
+      if (!payload) return restError('not_found', `Unknown shop id "${shopMatch[1]}".`, 404);
+      withRamenDataAsOf(payload, await ramenDataAsOf(env));
+      return restJson(payload);
+    }
+
     // OpenAPI spec + a tiny docs page pointing at it
     if (request.method === 'GET' && url.pathname === '/openapi.yaml') {
       return new Response(OPENAPI_YAML, { headers: { 'content-type': 'application/yaml; charset=utf-8', ...CORS } });
     }
     if (request.method === 'GET' && url.pathname === '/docs') {
       return new Response(DOCS_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+    // Public 1,000-row sample, served on-domain (LP links here instead of a brand-external GitHub account).
+    if (request.method === 'GET' && url.pathname === '/sample_1000.json') {
+      return new Response(RAMEN_SAMPLE, { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=3600', 'content-disposition': 'inline; filename="sample_1000.json"', ...CORS } });
     }
 
     // llms.txt — sign-post for agents (project summary, endpoints, datasets, license)
@@ -1436,27 +2946,47 @@ export default {
     // Landing page. no-cache so browsers/edge always revalidate — the page is a
     // small dynamic Worker response and must never show a stale pricing table.
     if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(LANDING_HTML, {
+      return new Response(isRamen ? RAMEN_LP_HTML : LANDING_HTML, {
         headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache, must-revalidate' },
       });
     }
+    // Ramen technical story (linked from the LP). On-domain so the public site has no external deps.
+    if (isRamen && request.method === 'GET' && (url.pathname === '/story' || url.pathname === '/story/')) {
+      return new Response(RAMEN_STORY_HTML, {
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache, must-revalidate' },
+      });
+    }
+    // Pro checkout entry (ramen). Redirects to the Stripe $500/mo Payment Link once it's set in
+    // PAYMENT_LINKS.ramen_pro; until then, falls back to the contact form so the button is never dead.
+    if (isRamen && request.method === 'GET' && url.pathname === '/subscribe') {
+      // ?test=1 → Stripe test-mode link for sandbox payment testing (live default otherwise).
+      const link = url.searchParams.get('test') === '1' ? PAYMENT_LINK_RAMEN_PRO_TEST : PAYMENT_LINKS.ramen_pro;
+      const dest = /^https?:\/\//.test(link) ? link : `${RAMEN_UPGRADE_URL}/#contact`;
+      return Response.redirect(dest, 302);
+    }
 
     if (request.method === 'GET' && url.pathname === '/robots.txt') {
+      const sm = isRamen ? 'https://ramen.gachi-tokusuru.com/sitemap.xml' : 'https://api.gachi-tokusuru.com/sitemap.xml';
       return new Response(
-        'User-agent: *\nAllow: /\nSitemap: https://api.gachi-tokusuru.com/sitemap.xml\n',
+        `User-agent: *\nAllow: /\nSitemap: ${sm}\n`,
         { headers: { 'content-type': 'text/plain; charset=utf-8' } },
       );
     }
 
     if (request.method === 'GET' && url.pathname === '/sitemap.xml') {
-      return new Response(
-        '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      // lastmod is static — update when the LP/story content materially changes.
+      const xml = isRamen
+        ? '<?xml version="1.0" encoding="UTF-8"?>\n' +
+          '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+          '  <url>\n    <loc>https://ramen.gachi-tokusuru.com/</loc>\n    <lastmod>2026-07-10</lastmod>\n    <changefreq>monthly</changefreq>\n    <priority>1.0</priority>\n  </url>\n' +
+          '  <url>\n    <loc>https://ramen.gachi-tokusuru.com/story</loc>\n    <lastmod>2026-07-10</lastmod>\n    <changefreq>monthly</changefreq>\n    <priority>0.8</priority>\n  </url>\n' +
+          '</urlset>\n'
+        : '<?xml version="1.0" encoding="UTF-8"?>\n' +
           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
           '  <url><loc>https://api.gachi-tokusuru.com/</loc></url>\n' +
           '  <url><loc>https://api.gachi-tokusuru.com/docs</loc></url>\n' +
-          '</urlset>\n',
-        { headers: { 'content-type': 'application/xml; charset=utf-8' } },
-      );
+          '</urlset>\n';
+      return new Response(xml, { headers: { 'content-type': 'application/xml; charset=utf-8' } });
     }
 
     // No-auth sample response (click-to-try; fixed to Shinjuku so it isn't a free unlimited API)
@@ -1541,10 +3071,19 @@ export default {
         return fail(`<p>${msg}</p>`, 403);
       }
       const label = PLAN_META[r.plan]?.label || r.plan;
-      const limit = (PLAN_LIMITS[r.plan] || 0).toLocaleString('en-US');
+      const isRamenPlan = PLAN_META[r.plan]?.product === 'ramen';
+      const lim = PLAN_LIMITS[r.plan];
+      const quota = lim === Infinity ? 'unlimited requests' : `${lim.toLocaleString('en-US')} requests/month`;
+      const host = isRamenPlan ? 'https://ramen.gachi-tokusuru.com' : 'https://api.gachi-tokusuru.com';
+      const restEx = isRamenPlan
+        ? `curl "${host}/v1/shops?pref=Tokyo&limit=3" \\\n  -H "Authorization: Bearer ${r.key}"`
+        : `curl "${host}/v1/station-toilets/search?station=Shinjuku" \\\n  -H "Authorization: Bearer ${r.key}"`;
+      const mcpEx = isRamenPlan
+        ? `{"mcpServers":{"japan-ramen":{"url":"${host}/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}`
+        : `{"mcpServers":{"gachi-data":{"url":"${host}/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}`;
       return new Response(activatePage(
         `<h1>✅ You're on ${label}</h1>`
-        + `<p>Thanks for subscribing. Here is your API key (${limit} requests/month, MCP + REST):</p>`
+        + `<p>Thanks for subscribing. Here is your API key (${quota}, MCP + REST):</p>`
         + `<div class="key" id="apikey">${r.key}</div>`
         + '<p><button type="button" id="copybtn" onclick="copyKey()">Copy key</button></p>'
         + '<p><b>Save it now</b> — treat it like a password. <b>Bookmark this page (this exact URL).</b> '
@@ -1552,15 +3091,15 @@ export default {
         + (r.emailed ? ", and we've also emailed it to you as a backup." : '.') + '</p>'
         + `<script>function copyKey(){var k=document.getElementById('apikey').textContent.trim();var b=document.getElementById('copybtn');function done(){b.textContent='Copied!';setTimeout(function(){b.textContent='Copy key';},2000);}function fb(){try{var r=document.createRange();r.selectNode(document.getElementById('apikey'));var s=window.getSelection();s.removeAllRanges();s.addRange(r);document.execCommand('copy');done();}catch(e){b.textContent='Select the key and press Ctrl+C';}}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(k).then(done).catch(fb);}else{fb();}}</script>`
         + '<p>First call:</p>'
-        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">curl "https://api.gachi-tokusuru.com/v1/station-toilets/search?station=Shinjuku" \\\n  -H "Authorization: Bearer ${r.key}"</pre>`
+        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">${restEx}</pre>`
         + '<p>MCP client config:</p>'
-        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">{"mcpServers":{"gachi-data":{"url":"https://api.gachi-tokusuru.com/mcp","headers":{"Authorization":"Bearer ${r.key}"}}}}</pre>`
-        + '<p class="mut">Full API docs: <a href="/docs">/docs</a>. This key works for both MCP and REST (shared monthly quota).</p>'
+        + `<pre style="background:#f6f8f7;border:1px solid #e3e8e6;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px">${mcpEx}</pre>`
+        + `<p class="mut">${isRamenPlan ? 'Full docs: <a href="https://ramen.gachi-tokusuru.com/story">the story</a>.' : 'Full API docs: <a href="/docs">/docs</a>.'} This key works for both MCP and REST${lim === Infinity ? '.' : ' (shared monthly quota).'}</p>`
         + `<p class="mut">Manage or cancel your subscription anytime: <a href="${PORTAL_URL}">billing portal</a>. Questions? contact@gachi-tokusuru.com</p>`,
       ), { headers: htmlHeaders });
     }
 
-    // Self-serve free key
+    // Self-serve key. Both hosts mint the standard Free key (nationwide, 1,000/month, REST + MCP).
     if (request.method === 'POST' && url.pathname === '/keys') {
       let b;
       try { b = await request.json(); } catch { return Response.json({ error: 'invalid json' }, { status: 400 }); }
@@ -1569,8 +3108,15 @@ export default {
         return Response.json({ error: 'valid email required' }, { status: 400 });
       }
       const rl = await mintRateLimit(env, request);
-      if (!rl.ok) return Response.json({ error: 'rate_limited', message: 'Too many free keys created from your network today. Try again tomorrow, or contact us for higher volume.' }, { status: 429, headers: { 'retry-after': '3600', ...CORS } });
-      const token = await issueFreeKey(env, email);
+      if (!rl.ok) return Response.json({ error: 'rate_limited', message: 'Too many keys created from your network today. Try again tomorrow, or contact us for higher volume.' }, { status: 429, headers: { 'retry-after': '3600', ...CORS } });
+      if (isRamen) {
+        const token = await issueFreeKey(env, email, 'ramen');
+        return Response.json({
+          api_key: token, plan: 'free', monthly_limit: PLAN_LIMITS.free, coverage: 'nationwide (all 47 prefectures)',
+          note: `Free key: nationwide, ${PLAN_LIMITS.free} requests/month, REST + MCP. Upgrade to Pro for unlimited volume, higher QPS and a commercial licence: ${RAMEN_UPGRADE_URL}`,
+        }, { headers: CORS });
+      }
+      const token = await issueFreeKey(env, email, 'gachi');
       return Response.json({ api_key: token, plan: 'free', monthly_limit: PLAN_LIMITS.free });
     }
 
@@ -1589,48 +3135,113 @@ export default {
       return Response.json({ ok: true });
     }
 
+    // MCP endpoint — non-POST surface. Streamable HTTP says a server that offers no SSE stream on
+    // GET MUST answer 405, not 404: 404 is reserved for "session expired", which sends clients into
+    // a re-initialize loop and reads as unreachable to registry health checks.
+    if (url.pathname === '/mcp' && request.method !== 'POST') {
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: MCP_CORS });
+      return new Response(null, { status: 405, headers: { allow: 'POST, OPTIONS', ...MCP_CORS } });
+    }
+
     // MCP endpoint
     if (request.method === 'POST' && url.pathname === '/mcp') {
       let body;
       try { body = await request.json(); } catch {
-        return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 });
+        return Response.json(rpcError(null, -32700, 'parse error'), { status: 400, headers: MCP_CORS });
       }
-      // Introspection (initialize / tools/list / notifications) is open — no key needed,
-      // so any client or directory can discover the tools. Only tools/call needs a key + metering.
+      // Our own scripts (benchmark eval, reflect_crawl health gate, ...) hit this same production
+      // endpoint on purpose — but must never count as external usage. They self-identify via this
+      // header; matching requests are excluded from every stat:*/stats:* KPI bucket below and land in
+      // a single internal counter instead, so usage_history.csv stays a clean external-only signal.
+      const isInternal = request.headers.get('x-gachi-internal') === '1';
+      // Introspection is open — no key needed — so any client or directory can discover the tools.
+      // Both api.* and ramen.* are callable no-auth (public/factual data), IP rate-limited. Metering
+      // applies ONLY when a key is presented. ramen.* no-auth gets reduced caps (see ramenNoauth).
+      let ramenNoauth = false;
       if (body?.method === 'tools/call') {
+        // Scope the surface by host, both ways: ramen.* exposes ONLY the ramen tools; api.* exposes
+        // everything EXCEPT them. An out-of-scope tool is simply "unknown" here (rejected before auth).
+        const _nm = body?.params?.name;
+        // ping is a host-neutral health check exposed on BOTH surfaces; everything else stays scoped.
+        if (_nm !== 'ping' && ((isRamen && !RAMEN_TOOL_NAMES.has(_nm)) || (!isRamen && RAMEN_TOOL_NAMES.has(_nm)))) {
+          return Response.json(rpcError(body.id ?? null, -32602, `unknown tool: ${_nm}`), { status: 200, headers: CORS });
+        }
         const auth = await resolveAuth(request, env);
         if (!auth.ok) {
-          return Response.json(
-            rpcError(body.id ?? null, -32001, 'unauthorized: get a free key at ' + UPGRADE_URL),
-            { status: 401, headers: { 'WWW-Authenticate': `Bearer resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="${OAUTH_SCOPE}"`, ...CORS } },
-          );
-        }
-        // Context API tools honour the same Free 1-municipality/day preview gate as REST.
-        const toolName = body?.params?.name;
-        if (auth.plan === 'free' && (toolName === 'get_municipality_context' || toolName === 'get_station_context')) {
-          const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-          const dk = `ctxday:${auth.token}:${day}`;
-          const dused = parseInt((await env.TOILET_KV.get(dk)) || '0', 10);
-          if (dused >= 1) {
+          // No/invalid key on either host: rate-limit every no-auth call by IP (NOAUTH_LIMITER covers
+          // ALL tools, not a subset), then serve with no metering. On ramen.* the no-auth path runs
+          // with reduced caps (limit 20, radius 2,000 m, changes truncated) but all 47 prefectures —
+          // the $500 Pro moat is REST/feed keys + the bulk-proof interface shape, not MCP access.
+          const rl = await noauthCallLimit(env, request);
+          if (!rl.ok) {
             return Response.json(
-              rpcError(body.id ?? null, -32003, `Context API preview is 1 municipality/day on Free — upgrade for unlimited: ${UPGRADE_URL}`),
-              { status: 429, headers: { 'retry-after': '86400' } },
+              rpcError(body.id ?? null, -32005, 'Rate limit exceeded (60 requests/minute per IP). Slow down, or get a free key for higher, metered limits: ' + UPGRADE_URL),
+              { status: 429, headers: { 'retry-after': '60', ...CORS } },
             );
           }
-          await env.TOILET_KV.put(dk, String(dused + 1), { expirationTtl: 172800 });
-        }
-        const m = await meterUsage(env, auth.token, auth.plan);
-        if (!m.allowed) {
-          return Response.json(
-            rpcError(body.id ?? null, -32002,
-              `monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade to Pro: ${UPGRADE_URL}`),
-            { status: 429, headers: { 'retry-after': '3600' } },
-          );
+          ramenNoauth = isRamen;
+          if (ramenNoauth && !isInternal) bumpNoauthStat(env, ctx, 'mcp');
+          // fall through to handleRpc — public/factual data, no metering.
+        } else {
+          // Per-key burst limit (QPS by plan). Even "unlimited" plans get a speed ceiling; the
+          // monthly quota is unaffected — this only throttles the request RATE.
+          const bl = await keyedBurstLimit(env, auth);
+          if (!bl.ok) {
+            return Response.json(
+              rpcError(body.id ?? null, -32005, `Rate limit exceeded (${bl.rps} req/s on ${auth.plan}). Slow the request rate — your monthly quota is unaffected.`),
+              { status: 429, headers: { 'retry-after': '1', ...CORS } },
+            );
+          }
+          // Ramen product entitlement: a general Gachi Data API key must NEVER reach the ramen tools.
+          // ping is exempt — it's a host-neutral health check, callable with any (or no) key.
+          if (isRamen && _nm !== 'ping' && auth.product !== 'ramen' && auth.product !== 'all') {
+            return Response.json(
+              rpcError(body.id ?? null, -32004, 'This key is not valid for the Ramen API. Get a ramen key at https://ramen.gachi-tokusuru.com'),
+              { status: 403, headers: CORS },
+            );
+          }
+          // Context API tools honour the same Free 1-municipality/day preview gate as REST.
+          const toolName = body?.params?.name;
+          if (auth.plan === 'free' && (toolName === 'get_municipality_context' || toolName === 'get_station_context')) {
+            const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            const dk = `ctxday:${auth.token}:${day}`;
+            const dused = parseInt((await env.TOILET_KV.get(dk)) || '0', 10);
+            if (dused >= 1) {
+              return Response.json(
+                rpcError(body.id ?? null, -32003, `Context API preview is 1 municipality/day on Free — upgrade for unlimited: ${UPGRADE_URL}`),
+                { status: 429, headers: { 'retry-after': '86400' } },
+              );
+            }
+            await env.TOILET_KV.put(dk, String(dused + 1), { expirationTtl: 172800 });
+          }
+          const m = await meterUsageFor(env, auth);
+          if (!m.allowed) {
+            const msg = m.daily
+              ? `daily limit reached (${m.used}/${m.limit} on ${auth.plan}), resets 00:00 UTC. Upgrade to Pro for unlimited: ${RAMEN_UPGRADE_URL}`
+              : `monthly limit reached (${m.used}/${m.limit} on ${auth.plan}). Upgrade to Pro: ${UPGRADE_URL}`;
+            return Response.json(
+              rpcError(body.id ?? null, -32002, msg),
+              { status: 429, headers: { 'retry-after': '3600' } },
+            );
+          }
         }
       }
-      const result = await handleRpc(body, env);
-      if (result === null) return new Response(null, { status: 202 });
-      return Response.json(result);
+      if (isInternal) {
+        // Keep a single low-cardinality counter so an internal-traffic spike is still visible, without
+        // touching any of the external-usage buckets (call/list, ref attribution, per-tool retention).
+        bumpInternalStat(env, ctx, isRamen ? 'ramen' : 'api', body?.method);
+      } else {
+        // Usage measurement: count tools/call (real use) vs tools/list (introspection) per host.
+        bumpMcpMethodStat(env, ctx, isRamen ? 'ramen' : 'api', body?.method);
+        // Channel attribution: if the MCP URL carried ?ref=<tag>, count initialize + tools/call per host,
+        // per ref tag. Observation only — never affects the response; no-ref requests are not counted.
+        bumpRefStat(env, ctx, isRamen ? 'ramen' : 'api', url.searchParams.get('ref'), body?.method);
+        // Retention measurement (ramen host only): per-tool + initialize, keyed by JST date.
+        if (isRamen) bumpRamenToolStat(env, ctx, body?.method, body?.params?.name);
+      }
+      const result = await handleRpc(body, env, { ramenOnly: isRamen, ramenNoauth });
+      if (result === null) return new Response(null, { status: 202, headers: MCP_CORS });
+      return Response.json(result, { headers: MCP_CORS });
     }
 
     return new Response('not found', { status: 404 });
@@ -1972,6 +3583,7 @@ year    passenger_journeys
      vacancy × ridership × hazard × population, and update this Data Story's example accordingly. -->
 <p>Ridership from the open dataset, hazard from the API — joined on one <code>station_id</code>. The Context API will fold vacancy × ridership × hazard × population into a single call: next on the roadmap.</p>
 
+
 <h2 id="prior-art">Prior art &amp; why we're different</h2>
 <p>We're not the first to open up Japanese railway and station data, and we stand on the shoulders of the people who tried before us. A few we learned from and respect:</p>
 <ul>
@@ -1999,7 +3611,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
 > Free tier; MCP + REST share one key.
 
 ## API access
-- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_municipality_context, get_station_context, get_toilet_by_station, get_public_toilet_by_city, get_station_hazard, get_active_alerts, get_station_alerts, get_train_status)
+- MCP endpoint: https://api.gachi-tokusuru.com/mcp (JSON-RPC; tools: get_municipality_context, get_station_context, get_toilet_by_station, get_public_toilet_by_city, get_station_hazard, station_search, get_active_alerts, get_station_alerts, get_train_status)
 - REST GET /v1/station-toilets/search?station=Shinjuku  (station name English or Japanese)
 - REST GET /v1/toilets/nearby?lat=&lng=&radius=&wheelchair=&ostomate=&diaper=  (radius metres, max 2000)
 - REST GET /v1/stations/{station_id}/hazard  (official MLIT hazard categories at a station, relayed live; station_id e.g. st_00001)
@@ -2008,6 +3620,7 @@ const LLMS_TXT = `# Gachi Data API — Japan Station & Accessibility Data (API �
   - REST GET /v1/alerts/active · /v1/alerts/area/{code} · /v1/stations/{station_id}/alerts  (JMA river flood forecasts (levels 2-5) & landslide alerts ONLY — not general weather warnings, not earthquakes; each response has a coverage array; relay of official facts, not a warning we issue)
   - REST GET /v1/lines/status · /v1/lines/{line_id}/status · /v1/stations/{station_id}/lines/status  (ODPT train service status; enum normal/delayed/suspended/resumed)
   - Every realtime response carries fetched_at (+ source_published_at for trains); stale data is flagged stale:true or 503, never returned silently.
+  - Provenance: facts observed from public web ramen listings; records cross-checked against Japanese municipality open data (© 各自治体オープンデータ, CC BY); municipality via reverse geocoding © 国土地理院 (GSI); freshness/keito/payment/romanization layers are original © gachi-tokusuru.com. Joins to the Japan Station Master via station.id (st_xxxx).
 - Our JMA pipeline also powers a public alert feed on X (@gachi_tokusuru) — proof the relay is alive.
 - Auth: Authorization: Bearer <key>. Free keys: https://api.gachi-tokusuru.com
 - OpenAPI: https://api.gachi-tokusuru.com/openapi.yaml
