@@ -73,7 +73,7 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'permit-pref-fix-keito-spicy-b-v2',
+  commit: 'menu-signature-v1',
   built: '2026-08-01T00:45:00Z',
   build: 'P0 Step3 + P2-3(B): permit-path pref errors fixed (8 shops via record_override — Moji-ku 5 were Yamaguchi etc; root cause reverse_geocoder nearest-city-point library in gen_pref_override.py replaced with GSI muniCd; city-pref consistency check added to 06_publish, now reports 0; full-DB N03 re-audit: 0 genuine mismatches remain, 2 border-coordinate false positives kept as-is). keito coarse bucket spicy absorbed into tantanmen per decision B — keito=spicy stays accepted as a backward-compat alias returning identical results, removed from docs; spiciness filtering lives on the spice_level attribute axis. Prior deploy: spice-filter-exposure-v1.',
   pricing_tiers: 5,
@@ -1781,6 +1781,7 @@ function ramenPublicShape(s) {
     ...(s.hours_class && s.hours_class.length ? { hours_class: s.hours_class } : {}),
     ...(s.midnight_hours != null ? { midnight_hours: s.midnight_hours } : {}),
     ...(s.spice_level ? { spice_level: s.spice_level } : {}),  // 属性軸(spicyのみ格納・null=unknownは省略)
+    ...(s.menu_signature && s.menu_signature.length ? { menu_signature: s.menu_signature } : {}),  // 名物メニュー名(チェーン裁定・事実のみ)
     station: st ? { name: st.name, name_en: st.name_en, distance_meters: st.distance_meters } : null,
     payment: p ? { cash_only: p.cash_only, card_accepted: p.card_accepted, qr_accepted: p.qr_accepted, state: p.state } : null,
     sources: s.sources,
@@ -1954,7 +1955,10 @@ const VIBE_HOURS_INTENT = [
 // 否定形(辛くない/控えめ/苦手)では発火しない。「担々麺/tantanmen」は意図的に不発火
 // (汁なし白胡麻系など辛くない店があるため。spice_levelはkeitoと独立の裁定)。
 const VIBE_SPICE_NEG = /辛くない|辛さ控えめ|辛さ抑えめ|辛いの(?:苦手|だめ|ダメ)|not spicy|mild/i;
-const VIBE_SPICE_INTENT = /激辛|辛い|辛め|辛口|オロチョン|カラシビ|麻辣|マーラー|spicy|\bhot\b/i;
+// オロチョンはメニュー名(2026-08-01 menu_signature軸新設で語彙がコーパス入り)なので発火語から除外 —
+// 「オロチョンラーメン」はsemanticで提供店(ひむろ等・spice未裁定含む)に直撃させる。激辛/辛い等の
+// 一般辛さ語は従来どおりhardフィルタ発火(R7回帰クエリは激辛+辛味噌を含むため挙動不変)。
+const VIBE_SPICE_INTENT = /激辛|辛い|辛め|辛口|カラシビ|麻辣|マーラー|spicy|\bhot\b/i;
 // Indirect scenario words (season / body condition) -> concrete corpus vocabulary.
 // The vector corpus is built from taxonomy phrases (vibe/keito_map.py), so queries like
 // 「汗だくの夏に塩分補給」 share zero tokens with any shop sentence. When a scenario fires we
