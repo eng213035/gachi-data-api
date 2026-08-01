@@ -73,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'menu-signature-v1',
-  built: '2026-08-01T00:45:00Z',
-  build: 'P0 Step3 + P2-3(B): permit-path pref errors fixed (8 shops via record_override — Moji-ku 5 were Yamaguchi etc; root cause reverse_geocoder nearest-city-point library in gen_pref_override.py replaced with GSI muniCd; city-pref consistency check added to 06_publish, now reports 0; full-DB N03 re-audit: 0 genuine mismatches remain, 2 border-coordinate false positives kept as-is). keito coarse bucket spicy absorbed into tantanmen per decision B — keito=spicy stays accepted as a backward-compat alias returning identical results, removed from docs; spiciness filtering lives on the spice_level attribute axis. Prior deploy: spice-filter-exposure-v1.',
+  commit: 'concept-expand-v4',
+  built: '2026-08-01T07:40:00Z',
+  build: 'P1 concept-expansion dictionary (VIBE_CONCEPT_EXPAND) + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v3 (v3=オロチョン語彙を北海道 札幌 味噌 辛いへ再調整・v4=output schema doc追記のみ).',
   pricing_tiers: 5,
 };
 
@@ -447,7 +447,10 @@ const TOOLS = [
       'Tip: concrete food words (style, broth, richness, place, hours) match far better than abstract mood ' +
       'words ("stylish", "hardcore") — translate moods into concrete attributes before querying. ' +
       'Prefecture intent in the query text (北海道, 博多の…) is auto-applied as a filter (pref_source: inferred); ' +
-      'region-style names (札幌ラーメン, 喜多方, 佐野…) stay pure style words and never restrict location.',
+      'region-style names (札幌ラーメン, 喜多方, 佐野…) stay pure style words and never restrict location. ' +
+      'Dish-concept words (オロチョン, カラシビ, 台湾ラーメン/まぜそば, 勝浦タンタンメン) are expanded into their ' +
+      'constituent style vocabulary before embedding (transparent via concept_expansion in the echoed query) — ' +
+      'expansion never adds filters, so shops serving the dish always stay eligible.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -527,7 +530,7 @@ const TOOL_OUTPUT_SCHEMAS = {
     window: obj('Time window covered.'), data_as_of: s('Dataset freshness date.'),
   }, 'Change feed: new shops, closure candidates, verified closures, reopenings.'),
   vibe_search: openObj({
-    query: obj('Echo of the resolved query.'), count: s('Results returned.'),
+    query: obj('Echo of the resolved query — includes scene_expansion / concept_expansion when a scenario or dish-concept word (オロチョン, カラシビ, 台湾まぜそば…) was expanded into style vocabulary before embedding.'), count: s('Results returned.'),
     shops: { type: 'array', description: 'Closest shops by meaning, best first.', items: { ...RAMEN_SHOP_ITEM, properties: { ...RAMEN_SHOP_ITEM.properties, similarity: s('Cosine similarity of this shop to the query (0–1, higher = closer).') } } },
     note: s('Human-readable note.'), data_as_of: s('Dataset freshness date (YYYY-MM-DD).'),
   }, 'Semantic search results (lite shape + similarity score).'),
@@ -1971,6 +1974,24 @@ const VIBE_SCENE_EXPAND = [
   [/二日酔い|飲み過ぎ|酔い覚まし/, 'shio 塩 shoyu 醤油 淡麗 light clear broth', { rich: 'assari' }],
   [/背徳/, 'こってり 濃厚 rich heavy thick broth', { rich: 'kotteri' }],
 ];
+// Concept words (dish/style names) -> constituent corpus vocabulary (2026-08-01 承認裁定).
+// 「オロチョンラーメン=北海道系×味噌×辛い」のように概念語を構成要素へ展開してから embed する。
+// VIBE_SCENE_EXPAND との違い: (1) 複数マッチを全部適用(「カラシビ台湾まぜそば」等の複合語対応)、
+// (2) hard フィルタ(spice/richness/hours)も pref も一切発火させない — 概念→spicy を hard 化すると
+// spice 未裁定の提供店(ひむろ等)が除外される事故(2026-08-01 修正済)が再発する。地名も語彙として
+// 足すだけで pref は縛らない(台湾ラーメン→愛知県にすると県外提供店を殺す)。透明化は concept_expansion。
+// 却下裁定: スタミナラーメン(埼玉/茨城/奈良天理の3系統に意味が割れ、どの展開でも誤シグナル注入)、
+// 蒙古タンメン(チェーン名直撃で機能済み・一般味噌辛い店を混ぜて名前直撃を薄めるリスクのみ)。
+// 語彙量の注意: 概念語がメニュー名/店名と同居する場合(オロチョン=ひむろ/利しり、カラシビ=鬼金棒)、
+// 展開語彙が長いと名前直撃のシグナルを希釈して提供店が構成要素だけの店に抜かれる(実測: 札幌物産展系が
+// 利しりを、麻辣大学系が鬼金棒をtop20外へ)。この2エントリは意図的に短い語彙にしてある — 安易に増やさない。
+const VIBE_CONCEPT_EXPAND = [
+  [/オロチョン/, '北海道 札幌 味噌 辛い'],
+  [/カラシビ|辛痺/, '花椒 山椒 しびれ 痺れ 担々麺 辛い'],
+  [/台湾ラーメン|台湾らーめん/, '名古屋 Nagoya 辛い spicy ひき肉 ミンチ ニラ 唐辛子 にんにく'],
+  [/台湾まぜそば|台湾混ぜそば/, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄'],
+  [/勝浦タンタンメン|勝浦担々麺|勝タン/, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy'],
+];
 // Query-intent -> prefecture filter (same inferred-filter idea as richness/hours).
 // Two tiers, tuned against style-name false positives:
 //   - FULL prefecture names (北海道/〜県/東京都/大阪府/京都府) always signal location.
@@ -2055,6 +2076,14 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       break;
     }
   }
+  // Concept expansion: vocabulary only — never touches rich/hrs/spc or the pref filter (see dict comment).
+  const conceptTerms = [];
+  for (const [rx, terms] of VIBE_CONCEPT_EXPAND) {
+    if (rx.test(q)) {
+      conceptTerms.push(terms);
+      embedText = `${embedText} ${terms}`;
+    }
+  }
   const attrFilter = {};
   if (rich) attrFilter.richness = rich;
   if (hrs) attrFilter.hours = hrs;
@@ -2126,6 +2155,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
     query: { q, pref: filter.pref || null, status: st, semantic: true,
              ...(filter.pref ? { pref_source: explicitPref ? 'param' : 'inferred' } : {}),
              ...(sceneTerms ? { scene_expansion: sceneTerms } : {}),
+             ...(conceptTerms.length ? { concept_expansion: conceptTerms.join(' / ') } : {}),
              ...(rich ? { richness: rich } : {}), ...(hrs ? { hours: hrs } : {}),
              ...(spc ? { spice: spc } : {}),
              ...(Object.keys(attrFilter).length ? { attr_filter_source: explicit ? 'param' : 'inferred' } : {}) },
