@@ -73,7 +73,7 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'permit-pref-fix-keito-spicy-b-v1',
+  commit: 'permit-pref-fix-keito-spicy-b-v2',
   built: '2026-08-01T00:45:00Z',
   build: 'P0 Step3 + P2-3(B): permit-path pref errors fixed (8 shops via record_override — Moji-ku 5 were Yamaguchi etc; root cause reverse_geocoder nearest-city-point library in gen_pref_override.py replaced with GSI muniCd; city-pref consistency check added to 06_publish, now reports 0; full-DB N03 re-audit: 0 genuine mismatches remain, 2 border-coordinate false positives kept as-is). keito coarse bucket spicy absorbed into tantanmen per decision B — keito=spicy stays accepted as a backward-compat alias returning identical results, removed from docs; spiciness filtering lives on the spice_level attribute axis. Prior deploy: spice-filter-exposure-v1.',
   pricing_tiers: 5,
@@ -1780,6 +1780,7 @@ function ramenPublicShape(s) {
     ...(s.richness ? { richness: s.richness } : {}),
     ...(s.hours_class && s.hours_class.length ? { hours_class: s.hours_class } : {}),
     ...(s.midnight_hours != null ? { midnight_hours: s.midnight_hours } : {}),
+    ...(s.spice_level ? { spice_level: s.spice_level } : {}),  // 属性軸(spicyのみ格納・null=unknownは省略)
     station: st ? { name: st.name, name_en: st.name_en, distance_meters: st.distance_meters } : null,
     payment: p ? { cash_only: p.cash_only, card_accepted: p.card_accepted, qr_accepted: p.qr_accepted, state: p.state } : null,
     sources: s.sources,
