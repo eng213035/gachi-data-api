@@ -73,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'concept-expand-v5',
-  built: '2026-08-01T09:20:00Z',
-  build: 'P1 concept-expansion dictionary (VIBE_CONCEPT_EXPAND) + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
+  commit: 'concept-expand-v7',
+  built: '2026-08-01T11:20:00Z',
+  build: 'v7: per-entry boost (オロチョン/カラシビ/勝タン=0.02, 台湾系=0.01 — 0.02 let a Miyagi spicy-miso shop outrank Nagoya 台湾ラーメン providers; multi-match takes max). v6: concept soft-rerank — spicy-implying concept entries carry {spice:spicy} SOFT hints; matching shops get +0.02 similarity nudge after retrieval (plain path, pool widened to topK20, transparent via concept_boost + per-shop concept_boost:true). Never a filter — hard spice from concepts would exclude unadjudicated providers (ひむろ). Base: P1 concept-expansion dictionary + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
   pricing_tiers: 5,
 };
 
@@ -450,7 +450,8 @@ const TOOLS = [
       'region-style names (札幌ラーメン, 喜多方, 佐野…) stay pure style words and never restrict location. ' +
       'Dish-concept words (オロチョン, カラシビ, 台湾ラーメン/まぜそば, 勝浦タンタンメン) are expanded into their ' +
       'constituent style vocabulary before embedding (transparent via concept_expansion in the echoed query) — ' +
-      'expansion never adds filters, so shops serving the dish always stay eligible.',
+      'expansion never adds filters, so shops serving the dish always stay eligible; spicy-implying concepts ' +
+      'additionally give spice-verified shops a small rank boost (concept_boost — a soft rerank, still no filter).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1985,12 +1986,20 @@ const VIBE_SCENE_EXPAND = [
 // 語彙量の注意: 概念語がメニュー名/店名と同居する場合(オロチョン=ひむろ/利しり、カラシビ=鬼金棒)、
 // 展開語彙が長いと名前直撃のシグナルを希釈して提供店が構成要素だけの店に抜かれる(実測: 札幌物産展系が
 // 利しりを、麻辣大学系が鬼金棒をtop20外へ)。この2エントリは意図的に短い語彙にしてある — 安易に増やさない。
+// 3rd element = implied SOFT attribute hints (2026-08-01 ②裁定): the dish implies 辛い, but a hard
+// spice filter would exclude unadjudicated provider shops (ひむろ incident) — so hints only nudge
+// ranking AFTER retrieval (+hint.boost to matching shops, re-sort). Direct name/menu hits
+// keep a sim lead ≳0.03 over constituent-only shops, so the small boost reorders "equally similar"
+// shops (spicy miso over plain miso) without displacing the providers on top.
+// boost is PER ENTRY: 0.02 where spiciness is the dish's core axis (オロチョン/カラシビ/勝タン),
+// 0.01 where regional identity dominates (台湾系 — 0.02 let a Miyagi spicy-miso shop outrank the
+// Nagoya 台湾ラーメン providers, 実測 2026-08-01). Multi-match takes the max.
 const VIBE_CONCEPT_EXPAND = [
-  [/オロチョン/, '北海道 札幌 味噌 辛い'],
-  [/カラシビ|辛痺/, '花椒 山椒 しびれ 痺れ 担々麺 辛い'],
-  [/台湾ラーメン|台湾らーめん/, '名古屋 Nagoya 辛い spicy ひき肉 ミンチ ニラ 唐辛子 にんにく'],
-  [/台湾まぜそば|台湾混ぜそば/, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄'],
-  [/勝浦タンタンメン|勝浦担々麺|勝タン/, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy'],
+  [/オロチョン/, '北海道 札幌 味噌 辛い', { spice: 'spicy', boost: 0.02 }],
+  [/カラシビ|辛痺/, '花椒 山椒 しびれ 痺れ 担々麺 辛い', { spice: 'spicy', boost: 0.02 }],
+  [/台湾ラーメン|台湾らーめん/, '名古屋 Nagoya 辛い spicy ひき肉 ミンチ ニラ 唐辛子 にんにく', { spice: 'spicy', boost: 0.01 }],
+  [/台湾まぜそば|台湾混ぜそば/, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄', { spice: 'spicy', boost: 0.01 }],
+  [/勝浦タンタンメン|勝浦担々麺|勝タン/, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy', { spice: 'spicy', boost: 0.02 }],
 ];
 // Query-intent -> prefecture filter (same inferred-filter idea as richness/hours).
 // Two tiers, tuned against style-name false positives:
@@ -2078,9 +2087,11 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
   }
   // Concept expansion: vocabulary only — never touches rich/hrs/spc or the pref filter (see dict comment).
   const conceptTerms = [];
-  for (const [rx, terms] of VIBE_CONCEPT_EXPAND) {
+  let conceptSpiceBoost = 0;
+  for (const [rx, terms, hint] of VIBE_CONCEPT_EXPAND) {
     if (rx.test(q)) {
       conceptTerms.push(terms);
+      if (hint && hint.spice === 'spicy') conceptSpiceBoost = Math.max(conceptSpiceBoost, hint.boost || 0);
       embedText = `${embedText} ${terms}`;
     }
   }
@@ -2134,28 +2145,47 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       }
     }
   } else {
+    // concept soft-rerank pool: retrieve up to 20 (Vectorize topK ceiling with metadata) so a
+    // spicy shop just below the cap can be lifted by the boost; truncated back to cap below.
+    const poolK = conceptSpiceBoost ? 20 : cap;
     const res = await env.VECTORIZE.query(vector, {
-      topK: cap, returnValues: false, returnMetadata: 'all',
+      topK: poolK, returnValues: false, returnMetadata: 'all',
       ...(Object.keys(filter).length ? { filter } : {}),
     });
     shops = (res && res.matches ? res.matches : []).map((m) => toShop(m, null));
-    if (inferredPref && shops.length < cap) {
+    if (inferredPref && shops.length < poolK) {
       const resB = await env.VECTORIZE.query(vector, {
-        topK: cap, returnValues: false, returnMetadata: 'all',
+        topK: poolK, returnValues: false, returnMetadata: 'all',
         ...(Object.keys(fallbackFilter).length ? { filter: fallbackFilter } : {}),
       });
       const seen = new Set(shops.map((s2) => s2.id));
       for (const m of (resB && resB.matches ? resB.matches : [])) {
-        if (seen.has(m.id) || shops.length >= cap) continue;
+        if (seen.has(m.id) || shops.length >= poolK) continue;
         shops.push(toShop(m, null));
       }
     }
+  }
+  // ② concept soft boost (2026-08-01): the dish implies spicy — nudge, never filter. Plain path
+  // only (the attr path orders verified-attribute shops first by design, and when a spice hard
+  // filter is already active the boost is a no-op anyway).
+  let conceptBoosted = false;
+  if (conceptSpiceBoost && !Object.keys(attrFilter).length) {
+    conceptBoosted = true;
+    for (const s2 of shops) {
+      if (s2.spice_level === 'spicy') {
+        s2.similarity = Math.round((s2.similarity + conceptSpiceBoost) * 10000) / 10000;
+        s2.concept_boost = true;
+      }
+    }
+    shops.sort((a, b) => b.similarity - a.similarity);
+    if (shops.length > cap) shops = shops.slice(0, cap);
   }
   return {
     query: { q, pref: filter.pref || null, status: st, semantic: true,
              ...(filter.pref ? { pref_source: explicitPref ? 'param' : 'inferred' } : {}),
              ...(sceneTerms ? { scene_expansion: sceneTerms } : {}),
              ...(conceptTerms.length ? { concept_expansion: conceptTerms.join(' / ') } : {}),
+             ...(conceptBoosted ? { concept_boost: `spice=spicy +${conceptSpiceBoost} (soft rerank — never a filter)` } : {}),
              ...(rich ? { richness: rich } : {}), ...(hrs ? { hours: hrs } : {}),
              ...(spc ? { spice: spc } : {}),
              ...(Object.keys(attrFilter).length ? { attr_filter_source: explicit ? 'param' : 'inferred' } : {}) },
