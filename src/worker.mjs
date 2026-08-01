@@ -73,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'concept-expand-v7',
-  built: '2026-08-01T11:20:00Z',
-  build: 'v7: per-entry boost (オロチョン/カラシビ/勝タン=0.02, 台湾系=0.01 — 0.02 let a Miyagi spicy-miso shop outrank Nagoya 台湾ラーメン providers; multi-match takes max). v6: concept soft-rerank — spicy-implying concept entries carry {spice:spicy} SOFT hints; matching shops get +0.02 similarity nudge after retrieval (plain path, pool widened to topK20, transparent via concept_boost + per-shop concept_boost:true). Never a filter — hard spice from concepts would exclude unadjudicated providers (ひむろ). Base: P1 concept-expansion dictionary + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
+  commit: 'soft-rerank-v1',
+  built: '2026-08-02T02:30:00Z',
+  build: 'P2-a: attr_matched hard-partition removed — INFERRED richness/hours are now soft-rerank hints (+0.02 proportional, attr_matched informational, transparent via attr_boost echo); spice stays a hard filter (R7 contract: 辛い intent returns only spicy-verified) and explicit richness/hours params stay strict. Fixes つじ田0.3876-above-ばり嗎0.5164 inversion. Prior: v7: per-entry boost (オロチョン/カラシビ/勝タン=0.02, 台湾系=0.01 — 0.02 let a Miyagi spicy-miso shop outrank Nagoya 台湾ラーメン providers; multi-match takes max). v6: concept soft-rerank — spicy-implying concept entries carry {spice:spicy} SOFT hints; matching shops get +0.02 similarity nudge after retrieval (plain path, pool widened to topK20, transparent via concept_boost + per-shop concept_boost:true). Never a filter — hard spice from concepts would exclude unadjudicated providers (ひむろ). Base: P1 concept-expansion dictionary + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
   pricing_tiers: 5,
 };
 
@@ -451,7 +451,9 @@ const TOOLS = [
       'Dish-concept words (オロチョン, カラシビ, 台湾ラーメン/まぜそば, 勝浦タンタンメン) are expanded into their ' +
       'constituent style vocabulary before embedding (transparent via concept_expansion in the echoed query) — ' +
       'expansion never adds filters, so shops serving the dish always stay eligible; spicy-implying concepts ' +
-      'additionally give spice-verified shops a small rank boost (concept_boost — a soft rerank, still no filter).',
+      'additionally give spice-verified shops a small rank boost (concept_boost — a soft rerank, still no filter). ' +
+      'Richness/hours inferred from the query text likewise act as a soft rank boost (attr_boost; attr_matched ' +
+      'is informational) — only explicit richness/hours params and spiciness intent filter strictly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2001,6 +2003,10 @@ const VIBE_CONCEPT_EXPAND = [
   [/台湾まぜそば|台湾混ぜそば/, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄', { spice: 'spicy', boost: 0.01 }],
   [/勝浦タンタンメン|勝浦担々麺|勝タン/, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy', { spice: 'spicy', boost: 0.02 }],
 ];
+// P2-a: INFERRED richness/hours are soft-rerank hints (never filters) — full-match shops get this
+// much similarity nudge, partial matches a proportional share. Fixed value pending the P2-b
+// fixed-vs-relative decision; explicit params and spice stay hard filters (see attrFilter comment).
+const VIBE_ATTR_BOOST = 0.02;
 // Query-intent -> prefecture filter (same inferred-filter idea as richness/hours).
 // Two tiers, tuned against style-name false positives:
 //   - FULL prefecture names (北海道/〜県/東京都/大阪府/京都府) always signal location.
@@ -2071,6 +2077,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
   if (hrs && !HOURS_VALUES.includes(hrs)) return { error: `hours must be one of ${HOURS_VALUES.join('/')}.`, attribution: RAMEN_ATTR };
   if (spc && spc !== 'spicy') return { error: 'spice must be "spicy" (the only filterable value — none/unknown are not filter targets).', attribution: RAMEN_ATTR };
   const explicit = Boolean(rich || hrs || spc);
+  const explicitRich = Boolean(rich), explicitHrs = Boolean(hrs);
   if (!rich) { for (const [rx, v] of VIBE_RICH_INTENT) if (rx.test(q)) { rich = v; break; } }
   if (!hrs) { for (const [rx, v] of VIBE_HOURS_INTENT) if (rx.test(q)) { hrs = v; break; } }
   if (!spc && VIBE_SPICE_INTENT.test(q) && !VIBE_SPICE_NEG.test(q)) spc = 'spicy';
@@ -2095,10 +2102,18 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       embedText = `${embedText} ${terms}`;
     }
   }
+  // P2-a (2026-08-02): hard/soft split. HARD filter = spice (adjudicated axis — the R7 contract is
+  // that 辛い-intent queries return ONLY spicy-verified shops) + attributes the caller explicitly
+  // passed as params (a deliberate request). SOFT = richness/hours merely INFERRED from query text:
+  // these used to hard-partition results (attr_matched=true first regardless of similarity —
+  // つじ田0.3876 above ばり嗎0.5164) and now only nudge ranking, the same soft-rerank pattern as
+  // concept_boost. attr_matched stays as an informational per-shop flag, no longer an ordering tier.
   const attrFilter = {};
-  if (rich) attrFilter.richness = rich;
-  if (hrs) attrFilter.hours = hrs;
+  const softAttr = {};
+  if (rich) { if (explicitRich) attrFilter.richness = rich; else softAttr.richness = rich; }
+  if (hrs) { if (explicitHrs) attrFilter.hours = hrs; else softAttr.hours = hrs; }
   if (spc) attrFilter.spice = spc;
+  const softKeys = Object.keys(softAttr);
   let vector;
   try {
     const emb = await env.AI.run('@cf/baai/bge-m3', { text: [embedText] });
@@ -2145,9 +2160,9 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       }
     }
   } else {
-    // concept soft-rerank pool: retrieve up to 20 (Vectorize topK ceiling with metadata) so a
-    // spicy shop just below the cap can be lifted by the boost; truncated back to cap below.
-    const poolK = conceptSpiceBoost ? 20 : cap;
+    // soft-rerank pool: retrieve up to 20 (Vectorize topK ceiling with metadata) so a boosted
+    // shop just below the cap can surface; truncated back to cap after the rerank below.
+    const poolK = (conceptSpiceBoost || softKeys.length) ? 20 : cap;
     const res = await env.VECTORIZE.query(vector, {
       topK: poolK, returnValues: false, returnMetadata: 'all',
       ...(Object.keys(filter).length ? { filter } : {}),
@@ -2165,17 +2180,24 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
       }
     }
   }
-  // ② concept soft boost (2026-08-01): the dish implies spicy — nudge, never filter. Plain path
-  // only (the attr path orders verified-attribute shops first by design, and when a spice hard
-  // filter is already active the boost is a no-op anyway).
+  // Soft rerank (P2-a 2026-08-02, extends the 2026-08-01 concept boost): one pass applies
+  // (a) inferred richness/hours hints — +VIBE_ATTR_BOOST scaled by how many hints the shop
+  // matches, attr_matched set informationally — and (b) the concept spice boost (skipped when a
+  // spice hard filter is already active: it would be a no-op). Nudge similarity, re-sort, truncate.
+  // Never a filter: shops matching nothing keep their similarity and stay eligible.
+  const conceptActive = conceptSpiceBoost && !attrFilter.spice;
   let conceptBoosted = false;
-  if (conceptSpiceBoost && !Object.keys(attrFilter).length) {
-    conceptBoosted = true;
+  if (softKeys.length || conceptActive) {
+    const inPlainPath = !Object.keys(attrFilter).length;
     for (const s2 of shops) {
-      if (s2.spice_level === 'spicy') {
-        s2.similarity = Math.round((s2.similarity + conceptSpiceBoost) * 10000) / 10000;
-        s2.concept_boost = true;
-      }
+      let nm = 0;
+      if (softAttr.richness && s2.richness === softAttr.richness) nm++;
+      if (softAttr.hours && (s2.hours_class || []).includes(softAttr.hours)) nm++;
+      if (softKeys.length && inPlainPath) s2.attr_matched = nm === softKeys.length;
+      let boost = softKeys.length ? VIBE_ATTR_BOOST * (nm / softKeys.length) : 0;
+      const conceptHit = conceptActive && s2.spice_level === 'spicy';
+      if (conceptHit) { boost += conceptSpiceBoost; s2.concept_boost = true; conceptBoosted = true; }
+      if (boost) s2.similarity = Math.round((s2.similarity + boost) * 10000) / 10000;
     }
     shops.sort((a, b) => b.similarity - a.similarity);
     if (shops.length > cap) shops = shops.slice(0, cap);
@@ -2188,6 +2210,7 @@ async function ramenVibeSearchPayload(env, { q, pref, status, limit, richness, h
              ...(conceptBoosted ? { concept_boost: `spice=spicy +${conceptSpiceBoost} (soft rerank — never a filter)` } : {}),
              ...(rich ? { richness: rich } : {}), ...(hrs ? { hours: hrs } : {}),
              ...(spc ? { spice: spc } : {}),
+             ...(softKeys.length ? { attr_boost: `${softKeys.map((k) => `${k}=${softAttr[k]}`).join(' ')} +${VIBE_ATTR_BOOST} (soft rerank — never a filter; attr_matched is informational)` } : {}),
              ...(Object.keys(attrFilter).length ? { attr_filter_source: explicit ? 'param' : 'inferred' } : {}) },
     count: shops.length, shops,
     note: 'Semantic matches, best first (lite shape + similarity 0–1). Use get_ramen_shop / GET /v1/shops/{id} for the full record; use search_ramen for exact name/keito/geo filters.',
