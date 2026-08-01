@@ -73,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'concept-expand-v4',
-  built: '2026-08-01T07:40:00Z',
-  build: 'P1 concept-expansion dictionary (VIBE_CONCEPT_EXPAND) + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v3 (v3=オロチョン語彙を北海道 札幌 味噌 辛いへ再調整・v4=output schema doc追記のみ).',
+  commit: 'concept-expand-v5',
+  built: '2026-08-01T09:20:00Z',
+  build: 'P1 concept-expansion dictionary (VIBE_CONCEPT_EXPAND) + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
   pricing_tiers: 5,
 };
 
@@ -460,7 +460,7 @@ const TOOLS = [
         status: { type: 'string', description: "Optional: active (default) / closed_confirmed / all." },
         richness: { type: 'string', description: 'Optional broth-richness filter from official-site enrichment: assari / kotteri / futsu / menu_varies. Auto-inferred from the query text (あっさり/こってり…) when omitted.' },
         hours: { type: 'string', description: 'Optional hours filter: morning / late_night / 24h. Auto-inferred from the query text (朝/深夜/24時間…) when omitted.' },
-        spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Explicit value wins over query-text inference (辛い/激辛/オロチョン/spicy…; negations like 辛くない do not trigger). Orthogonal to keito: keito is style lineage, spice_level is an attribute — tantanmen alone never implies spicy.' },
+        spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Explicit value wins over query-text inference (辛い/激辛/spicy…; negations like 辛くない do not trigger). IMPORTANT: do NOT set this for dish/menu-name queries (オロチョンラーメン, カラシビ, 台湾まぜそば, 勝浦タンタンメン…) — many shops SERVING those dishes have no spice adjudication yet, so this hard filter would exclude them; leave it unset and the engine reaches them via concept expansion + menu-name matching. Set it only when the user asks for spicy shops in general. Orthogonal to keito: keito is style lineage, spice_level is an attribute — tantanmen alone never implies spicy.' },
         spice: { type: 'string', description: 'Deprecated alias of spice_level (kept for backward compatibility).' },
       },
       required: ['q'],
