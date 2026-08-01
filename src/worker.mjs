@@ -24,7 +24,7 @@ const RAMEN_TOOL_NAMES = new Set(['search_ramen', 'get_ramen_shop', 'get_ramen_c
 
 // keito OUTPUT is the fine 19-value vocabulary as stored (champon/toripaitan/asahikawa… — 2026-07-21
 // taxonomy adoption: regional schools are the product's value, expose them). KEITO_COARSE remains as
-// the FILTER convenience layer: filtering by a coarse bucket (tonkotsu/miso/shoyu/shio/tsukemen/spicy/
+// the FILTER convenience layer: filtering by a coarse bucket (tonkotsu/miso/shoyu/shio/tsukemen/tantanmen/
 // other) matches every fine school in that bucket, e.g. keito=tonkotsu also returns iekei/jiro shops.
 const KEITO_COARSE = {
   tonkotsu: 'tonkotsu', iekei: 'tonkotsu', yokohama_iekei: 'tonkotsu', jiro: 'tonkotsu',
@@ -33,7 +33,7 @@ const KEITO_COARSE = {
   asahikawa: 'shoyu', shirakawa: 'shoyu', sano: 'shoyu', onomichi: 'shoyu',
   shio: 'shio',
   tsukemen: 'tsukemen',
-  tantanmen: 'spicy',
+  tantanmen: 'tantanmen',  // 旧coarse'spicy'はB案(2026-08-01決裁)でtantanmenへ吸収 — 辛さはspice_level軸へ
   abura_mazesoba: 'other', mazesoba: 'other', ramen_shop: 'other', curry: 'other', other: 'other',
   toripaitan: 'other', champon: 'other',
 };
@@ -48,8 +48,11 @@ function ramenCoarseKeito(arr) {
 // keito filter: a coarse bucket value → bucket match (keito=tonkotsu also returns iekei/jiro shops,
 // unchanged behavior); a fine value → EXACT fine match (keito=champon returns only champon shops,
 // not the whole 'other' bucket).
-const KEITO_COARSE_BUCKETS = new Set(['tonkotsu', 'miso', 'shoyu', 'shio', 'tsukemen', 'spicy', 'other']);
+const KEITO_COARSE_BUCKETS = new Set(['tonkotsu', 'miso', 'shoyu', 'shio', 'tsukemen', 'tantanmen', 'other']);
 function ramenKeitoMatch(shopKeito, q) {
+  // 後方互換: 旧coarse値'spicy'は実質tantanmenだったため同一結果を返すエイリアスとして受理し続ける
+  // (ドキュメントからは削除済み。辛さの絞り込みはspice_level属性軸を使う)。
+  if (q === 'spicy') q = 'tantanmen';
   if (KEITO_COARSE_BUCKETS.has(q)) return ramenCoarseKeito(shopKeito).includes(q);
   return (shopKeito || []).includes(q);
 }
@@ -70,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'spice-filter-exposure-v1',
-  built: '2026-07-31T20:30:00Z',
-  build: 'P2-1,2 (2026-07-31 instruction #2): spice_level exposed as an explicit filter — search_ramen gains spice_level param (spicy/unknown; works on pref/city, nearby and nationwide paths; lite/geo indexes now carry spice_level for the 357 spicy shops), vibe_search gains spice_level as the canonical param name (spice kept as deprecated alias; explicit wins over query-text inference). keito(lineage) vs spice_level(attribute) orthogonality documented in both schemas. Prior deploy: toilet-dedup-romaji-namecontains-v1.',
+  commit: 'permit-pref-fix-keito-spicy-b-v1',
+  built: '2026-08-01T00:45:00Z',
+  build: 'P0 Step3 + P2-3(B): permit-path pref errors fixed (8 shops via record_override — Moji-ku 5 were Yamaguchi etc; root cause reverse_geocoder nearest-city-point library in gen_pref_override.py replaced with GSI muniCd; city-pref consistency check added to 06_publish, now reports 0; full-DB N03 re-audit: 0 genuine mismatches remain, 2 border-coordinate false positives kept as-is). keito coarse bucket spicy absorbed into tantanmen per decision B — keito=spicy stays accepted as a backward-compat alias returning identical results, removed from docs; spiciness filtering lives on the spice_level attribute axis. Prior deploy: spice-filter-exposure-v1.',
   pricing_tiers: 5,
 };
 
@@ -388,7 +391,7 @@ const TOOLS = [
       properties: {
         pref: { type: 'string', description: 'Prefecture, Japanese (千葉県; short forms 千葉/東京) OR romaji (chiba/tokyo/saitama/osaka). Optional if city, q, or lat/lng is given.' },
         city: { type: 'string', description: 'Municipality, Japanese (松戸市, 世田谷区) OR romaji (kawaguchi, setagaya). Works alone — prefecture is auto-resolved (add pref if the romaji is ambiguous).' },
-        keito: { type: 'string', description: 'Optional ramen-style filter. Coarse bucket (tonkotsu, miso, shoyu, shio, tsukemen, spicy, other) matches every school in the bucket — tonkotsu also covers iekei/家系 & jiro/二郎. Or an exact fine value from the 19-value vocabulary: iekei, jiro, tsukemen, tantanmen, abura_mazesoba, chuka_tanrei, champon, toripaitan, sapporo, asahikawa, kitakata_aizu, shirakawa, sano, onomichi… (keito=champon returns only champon shops). ~23% of shops carry a style; the rest are unclassified.' },
+        keito: { type: 'string', description: 'Optional ramen-style filter (style LINEAGE — for spiciness use the spice_level attribute instead). Coarse bucket (tonkotsu, miso, shoyu, shio, tsukemen, tantanmen, other) matches every school in the bucket — tonkotsu also covers iekei/家系 & jiro/二郎. Or an exact fine value from the 19-value vocabulary: iekei, jiro, tsukemen, tantanmen, abura_mazesoba, chuka_tanrei, champon, toripaitan, sapporo, asahikawa, kitakata_aizu, shirakawa, sano, onomichi… (keito=champon returns only champon shops). ~23% of shops carry a style; the rest are unclassified.' },
         status: { type: 'string', description: 'Optional: active (default: all) / closed_candidate / closed_confirmed.' },
         spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (357 shops whose signature is spiciness — dual-verified, never guessed) or "unknown" (no spice data). Orthogonal to keito: keito is the style lineage, spice_level is an attribute — keito=spicy (coarse bucket, effectively tantanmen) does NOT mean the shop is spicy.' },
         chain: { type: 'string', description: 'Optional chain filter on the curated chain label (e.g. chain=ラーメンショップ matches the whole family incl. ラーショ/うまいラーメンショップ variants; also 山岡家, 一蘭, 天下一品…). Works nationwide alone or combined with pref/city/nearby. Unlike q, this is curated membership, not a name substring.' },
