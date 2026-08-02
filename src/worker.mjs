@@ -73,9 +73,9 @@ const PREF_EN_REV = {
 
 // Bumped on every deploy so /__version proves which build a given request hit.
 const BUILD_VERSION = {
-  commit: 'venue-type-v2',
-  built: '2026-08-02T06:20:00Z',
-  build: 'P3: scenario expansions can no longer contradict a stated richness (「こってり…二日酔い」 used to append 淡麗/light-clear from the 二日酔い entry — now suppressed and reported via scene_suppressed), and concept entries may carry a richness hint applied as the same soft boost (never a filter — richness coverage is 7%). P1 venue_type (決裁2026-08-02): 735 event records adjudicated (714 popup / 21 permanent) — popup = a limited-run appearance at an event or department-store fair, now EXCLUDED BY DEFAULT from search_ramen (all 3 paths), vibe_search (via ramen:popup_ids KV — vectors stay indexed so venue_type=popup still works semantically) and REST; venue_type param takes permanent(default)/popup/all. Sources: name-pattern safe layer 426 + dedup X_event 150 + agent adjudication 176 (mall tenants イオンモール/ららぽーと/マルシェ never匹配 — 日月堂イオン川口 & つじ田ららぽーと富士見 verified untouched). Unadjudicated stays null = permanent (never guessed). P2-b (決裁2026-08-02): all soft boosts unified on the RELATIVE form k0.25×pool_spread (vibe attr/concept + station soft filters; station keeps a 0.01 cap so a wide outlier-driven spread can never reach the measured partition threshold 0.0115). Fixed values retired: a fixed 0.02 moved 5+ ranks on a 0.019-wide pool while 0.005 was inert on wide station pools. 基準0 documented in code. P2-a: attr_matched hard-partition removed — INFERRED richness/hours are now soft-rerank hints (+0.02 proportional, attr_matched informational, transparent via attr_boost echo); spice stays a hard filter (R7 contract: 辛い intent returns only spicy-verified) and explicit richness/hours params stay strict. Fixes つじ田0.3876-above-ばり嗎0.5164 inversion. Prior: v7: per-entry boost (オロチョン/カラシビ/勝タン=0.02, 台湾系=0.01 — 0.02 let a Miyagi spicy-miso shop outrank Nagoya 台湾ラーメン providers; multi-match takes max). v6: concept soft-rerank — spicy-implying concept entries carry {spice:spicy} SOFT hints; matching shops get +0.02 similarity nudge after retrieval (plain path, pool widened to topK20, transparent via concept_boost + per-shop concept_boost:true). Never a filter — hard spice from concepts would exclude unadjudicated providers (ひむろ). Base: P1 concept-expansion dictionary + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
+  commit: 'zero-fallback-v2',
+  built: '2026-08-02T08:10:00Z',
+  build: 'v2: romaji aliases on the concept dictionary (orochon/karashibi/taiwan ramen|mazesoba/katsuura tantanmen) — visitors typing the dish in romaji got a generic noodle search because the concept regexes were kana-only (found via the P6 fallback on "Orochon ramen Saitama"). P6 zero-result fallback: a NAME search that matches nothing now returns fallback_shops (semantic match on the same pref → spiciness-signature shops → a plain pref count), never mixed into shops[] which stays empty and authoritative; fallback + fallback_step + fallback_reason{code,message} state what was relaxed, and the tool description/definitions tell agents to relay that caveat. Filter-only 0-results (keito/spice/chain with no q) do NOT trigger it — "none exist" is the truthful answer there. P3: scenario expansions can no longer contradict a stated richness (「こってり…二日酔い」 used to append 淡麗/light-clear from the 二日酔い entry — now suppressed and reported via scene_suppressed), and concept entries may carry a richness hint applied as the same soft boost (never a filter — richness coverage is 7%). P1 venue_type (決裁2026-08-02): 735 event records adjudicated (714 popup / 21 permanent) — popup = a limited-run appearance at an event or department-store fair, now EXCLUDED BY DEFAULT from search_ramen (all 3 paths), vibe_search (via ramen:popup_ids KV — vectors stay indexed so venue_type=popup still works semantically) and REST; venue_type param takes permanent(default)/popup/all. Sources: name-pattern safe layer 426 + dedup X_event 150 + agent adjudication 176 (mall tenants イオンモール/ららぽーと/マルシェ never匹配 — 日月堂イオン川口 & つじ田ららぽーと富士見 verified untouched). Unadjudicated stays null = permanent (never guessed). P2-b (決裁2026-08-02): all soft boosts unified on the RELATIVE form k0.25×pool_spread (vibe attr/concept + station soft filters; station keeps a 0.01 cap so a wide outlier-driven spread can never reach the measured partition threshold 0.0115). Fixed values retired: a fixed 0.02 moved 5+ ranks on a 0.019-wide pool while 0.005 was inert on wide station pools. 基準0 documented in code. P2-a: attr_matched hard-partition removed — INFERRED richness/hours are now soft-rerank hints (+0.02 proportional, attr_matched informational, transparent via attr_boost echo); spice stays a hard filter (R7 contract: 辛い intent returns only spicy-verified) and explicit richness/hours params stay strict. Fixes つじ田0.3876-above-ばり嗎0.5164 inversion. Prior: v7: per-entry boost (オロチョン/カラシビ/勝タン=0.02, 台湾系=0.01 — 0.02 let a Miyagi spicy-miso shop outrank Nagoya 台湾ラーメン providers; multi-match takes max). v6: concept soft-rerank — spicy-implying concept entries carry {spice:spicy} SOFT hints; matching shops get +0.02 similarity nudge after retrieval (plain path, pool widened to topK20, transparent via concept_boost + per-shop concept_boost:true). Never a filter — hard spice from concepts would exclude unadjudicated providers (ひむろ). Base: P1 concept-expansion dictionary + P2 menu_signature 56 chains (3,208 shops re-embedded). v2 fix over v1: trimmed オロチョン/カラシビ expansion vocabulary — long vocab diluted name-direct hits (Sapporo bussanten shops displaced 利しり, 麻辣大学-type shops displaced 鬼金棒 out of top20); concept entries whose word doubles as a menu/shop name must stay short. Expansion is vocabulary-only (never fires spice/richness/hours/pref; multi-match; transparent via concept_expansion). Rejected by decision: スタミナラーメン (meaning splits 3 regions), 蒙古タンメン (chain-name hit suffices). Prior deploy: concept-expand-v4. v5: spice_level param description fix — stale example list still named オロチョン as an inference trigger, which coached AI clients into passing spice_level=spicy explicitly for dish-name queries and hard-excluding unadjudicated provider shops (ひむろ; live incident 2026-08-01); now the description explicitly forbids setting the filter for dish/menu-name queries.',
   pricing_tiers: 5,
 };
 
@@ -385,7 +385,10 @@ const TOOLS = [
       '(e.g. q=一蘭 or q=ichiran, no prefecture needed). Or filter by prefecture (東京都/大阪府/〇〇県 ' +
       'or romaji tokyo/osaka/saitama), city (松戸市 or romaji kawaguchi), ramen style (keito), ' +
       'status (active/closed_candidate/closed_confirmed), or search near a coordinate (lat/lng + radius ' +
-      'up to 5 km). Facts only — no rankings, no reviews. Payment/midnight fields are tri-state (true/false/null=unknown).',
+      'up to 5 km). Facts only — no rankings, no reviews. Payment/midnight fields are tri-state (true/false/null=unknown). ' +
+      'If a NAME search matches nothing, the response adds fallback_shops (suggestions from a relaxed query — ' +
+      'closest by meaning, or spiciness-signature shops) alongside an empty shops[]; fallback_reason says what was ' +
+      'relaxed, so relay that caveat rather than presenting them as matches.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -394,7 +397,9 @@ const TOOLS = [
         keito: { type: 'string', description: 'Optional ramen-style filter (style LINEAGE — for spiciness use the spice_level attribute instead). Coarse bucket (tonkotsu, miso, shoyu, shio, tsukemen, tantanmen, other) matches every school in the bucket — tonkotsu also covers iekei/家系 & jiro/二郎. Or an exact fine value from the 19-value vocabulary: iekei, jiro, tsukemen, tantanmen, abura_mazesoba, chuka_tanrei, champon, toripaitan, sapporo, asahikawa, kitakata_aizu, shirakawa, sano, onomichi… (keito=champon returns only champon shops). ~23% of shops carry a style; the rest are unclassified.' },
         status: { type: 'string', description: 'Optional: active (default: all) / closed_candidate / closed_confirmed.' },
         venue_type: { type: 'string', description: 'Optional venue filter: "permanent" (DEFAULT — fixed storefronts) / "popup" (records of limited-run appearances at events and department-store fairs: 物産展, ラーメンショー…) / "all". Popups are excluded by default because the shop is no longer at that address; pass "popup" only to research event history. Shopping-mall tenants (イオンモール, ららぽーと, マルシェ-branded station buildings) count as permanent.' },
-        venue_type:
+        fallback:
+    'Present ONLY when the search matched nothing and a relaxed alternative was found. fallback_shops are NOT search results — they are suggestions from a relaxed query (fallback_step: semantic = closest by meaning; spice_attribute = shops whose signature is spiciness; pref_summary = no alternative, just a count). `shops` stays empty and authoritative: never present fallback_shops to a user as matches for their query without saying what was relaxed (fallback_reason.message says it).',
+  venue_type:
     'permanent = fixed storefront; popup = a record of a limited-run appearance at an event or department-store fair (物産展, ラーメンショー…), kept as history but excluded from search by default; absent = not adjudicated (never guessed, treated as permanent).',
   spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (357 shops whose signature is spiciness — dual-verified, never guessed) or "unknown" (no spice data). Orthogonal to keito: keito is the style lineage, spice_level is an attribute — keito=spicy (coarse bucket, effectively tantanmen) does NOT mean the shop is spicy.' },
         chain: { type: 'string', description: 'Optional chain filter on the curated chain label (e.g. chain=ラーメンショップ matches the whole family incl. ラーショ/うまいラーメンショップ variants; also 山岡家, 一蘭, 天下一品…). Works nationwide alone or combined with pref/city/nearby. Unlike q, this is curated membership, not a name substring.' },
@@ -466,7 +471,9 @@ const TOOLS = [
         status: { type: 'string', description: "Optional: active (default) / closed_confirmed / all." },
         richness: { type: 'string', description: 'Optional broth-richness filter from official-site enrichment: assari / kotteri / futsu / menu_varies. Auto-inferred from the query text (あっさり/こってり…) when omitted.' },
         hours: { type: 'string', description: 'Optional hours filter: morning / late_night / 24h. Auto-inferred from the query text (朝/深夜/24時間…) when omitted.' },
-        venue_type:
+        fallback:
+    'Present ONLY when the search matched nothing and a relaxed alternative was found. fallback_shops are NOT search results — they are suggestions from a relaxed query (fallback_step: semantic = closest by meaning; spice_attribute = shops whose signature is spiciness; pref_summary = no alternative, just a count). `shops` stays empty and authoritative: never present fallback_shops to a user as matches for their query without saying what was relaxed (fallback_reason.message says it).',
+  venue_type:
     'permanent = fixed storefront; popup = a record of a limited-run appearance at an event or department-store fair (物産展, ラーメンショー…), kept as history but excluded from search by default; absent = not adjudicated (never guessed, treated as permanent).',
   spice_level: { type: 'string', description: 'Optional spiciness ATTRIBUTE filter: "spicy" (shops whose signature is spiciness — chain signage or shop-name signal, dual-verified; ~1% of shops). Explicit value wins over query-text inference (辛い/激辛/spicy…; negations like 辛くない do not trigger). IMPORTANT: do NOT set this for dish/menu-name queries (オロチョンラーメン, カラシビ, 台湾まぜそば, 勝浦タンタンメン…) — many shops SERVING those dishes have no spice adjudication yet, so this hard filter would exclude them; leave it unset and the engine reaches them via concept expansion + menu-name matching. Set it only when the user asks for spicy shops in general. Orthogonal to keito: keito is style lineage, spice_level is an attribute — tantanmen alone never implies spicy.' },
         spice: { type: 'string', description: 'Deprecated alias of spice_level (kept for backward compatibility).' },
@@ -525,6 +532,10 @@ const RAMEN_SHOP_ITEM = {
 const TOOL_OUTPUT_SCHEMAS = {
   search_ramen: openObj({
     query: obj('Echo of the resolved query.'), count: s('Results returned.'), total_matched: s('Total matches before limit.'),
+    fallback: s('true only when nothing matched and a relaxed alternative is offered (shops stays empty).'),
+    fallback_step: s('Which relaxation produced fallback_shops: semantic / spice_attribute / pref_summary.'),
+    fallback_reason: obj('{code, message} — what was relaxed and why; relay this caveat to the user.'),
+    fallback_shops: arr('Suggestions from the relaxed query. NOT matches for the original query.'),
     shops: { type: 'array', description: 'Matching shops.', items: RAMEN_SHOP_ITEM }, note: s('Human-readable note.'),
     data_as_of: s('Dataset freshness date (YYYY-MM-DD).'),
   }, 'Ramen search results with freshness metadata.'),
@@ -1753,6 +1764,8 @@ const RAMEN_DEFS = {
     'a closed_candidate found open on web verification (high confidence, no successor record within 200 m) is restored to active',
   merged:
     'this id was consolidated into merged_into (duplicate-record dedup 2026-07-31). Old ids stay resolvable: get_ramen_shop / GET /v1/shops/{old_id} return the canonical record with merged_into set',
+  fallback:
+    'Present ONLY when the search matched nothing and a relaxed alternative was found. fallback_shops are NOT search results — they are suggestions from a relaxed query (fallback_step: semantic = closest by meaning; spice_attribute = shops whose signature is spiciness; pref_summary = no alternative, just a count). `shops` stays empty and authoritative: never present fallback_shops to a user as matches for their query without saying what was relaxed (fallback_reason.message says it).',
   venue_type:
     'permanent = fixed storefront; popup = a record of a limited-run appearance at an event or department-store fair (物産展, ラーメンショー…), kept as history but excluded from search by default; absent = not adjudicated (never guessed, treated as permanent).',
   spice_level:
@@ -1870,6 +1883,66 @@ async function ramenResolvePrefFromCity(env, city) {
   return { pref: prefs[0], city: key };
 }
 
+// P6 (2026-08-02): zero-result fallback for search_ramen. A name search that matches nothing is a
+// dead end for the caller ("Orochon ramen Saitama" → 0), and the useful answer is one relaxation
+// away. Design rules, in order of importance:
+//   1. NEVER put fallback rows in `shops` — they ride in `fallback_shops`, so a client that reads
+//      `shops` blindly still sees an honest empty result and cannot mistake them for matches.
+//   2. Only fires when the caller gave a NAME (q). A 0-result keito/spice/chain filter is a
+//      truthful "none exist", not a dead end — relaxing it would misrepresent the data.
+//   3. Every fallback states what was relaxed: fallback_step + a machine code + a human sentence.
+// Ladder (first hit wins): semantic match on the same pref → spicy-attribute shops when the query
+// carries a spiciness concept → a plain count of what the pref does hold.
+async function ramenZeroFallback(env, { q, pref, venueType }) {
+  if (!q) return null;
+  if (env.AI && env.VECTORIZE) {
+    const vs = await ramenVibeSearchPayload(env, { q, pref: pref || null, limit: 5, venueType });
+    const hits = (vs && vs.shops) || [];
+    if (hits.length) {
+      return {
+        fallback: true,
+        fallback_step: 'semantic',
+        fallback_reason: {
+          code: 'no_name_match_semantic_used',
+          message: `No shop name matched "${q}"${pref ? ` in ${pref}` : ''}. These are the closest shops BY MEANING (vibe_search), not name matches`
+            + `${vs.query && vs.query.concept_expansion ? ` — the dish concept was expanded to: ${vs.query.concept_expansion}` : ''}.`,
+        },
+        fallback_shops: hits,
+      };
+    }
+  }
+  if (VIBE_SPICE_INTENT.test(q) || VIBE_CONCEPT_EXPAND.some(([rx]) => rx.test(q))) {
+    const arr = pref ? await env.TOILET_KV.get(`ramen:pref:${pref}`, 'json') : await env.TOILET_KV.get('ramen:all_lite', 'json');
+    const spicy = (arr || []).filter((s) => s.spice_level === 'spicy' && s.venue_type !== 'popup').slice(0, 5);
+    if (spicy.length) {
+      return {
+        fallback: true,
+        fallback_step: 'spice_attribute',
+        fallback_reason: {
+          code: 'no_name_match_spicy_shown',
+          message: `No shop name matched "${q}"${pref ? ` in ${pref}` : ''}. The query reads as a spiciness request, so these are shops whose signature IS spiciness (spice_level=spicy) — not name matches.`,
+        },
+        fallback_shops: spicy.map(ramenPublicShape),
+      };
+    }
+  }
+  if (pref) {
+    const arr = await env.TOILET_KV.get(`ramen:pref:${pref}`, 'json');
+    if (arr) {
+      return {
+        fallback: true,
+        fallback_step: 'pref_summary',
+        fallback_reason: {
+          code: 'no_name_match_no_alternative',
+          message: `No shop name matched "${q}" in ${pref}, and no close alternative was found. ${pref} holds ${arr.length} shops — search again without q, or with a keito/spice_level filter.`,
+        },
+        fallback_shops: [],
+      };
+    }
+  }
+  return null;
+}
+
 async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng, radius, limit, match, chain, chainSub, spiceLevel, venueType, maxLimit = 50, maxRadius = 5000 }) {
   // spice_level(属性軸)フィルタ。spicy=看板が辛さ(裁定済357店) / unknown=データなし。keito(系統)とは独立。
   if (spiceLevel && !['spicy', 'unknown'].includes(spiceLevel)) {
@@ -1932,7 +2005,9 @@ async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng,
       if (q) out = out.filter((s) => ramenQMatch(s, q, exact));
       if (spiceLevel) out = out.filter(spiceMatch);
       out = out.filter(venueMatch);
+      const fbN = out.length === 0 ? await ramenZeroFallback(env, { q, pref: null, venueType }) : null;
       return {
+        ...(fbN || {}),
         query: { q: q || null, keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, ...(spiceLevel ? { spice_level: spiceLevel } : {}), venue_type: venueType || 'permanent', scope: 'nationwide' },
         count: Math.min(out.length, cap), total_matched: out.length, shops: out.slice(0, cap).map((s) => ({ ...s, keito: s.keito || [] })),
         note: 'Nationwide search (lite shape: id/name/name_en/pref/city/status). Use get_ramen_shop / GET /v1/shops/{id} for the full record.',
@@ -1956,7 +2031,9 @@ async function ramenSearchPayload(env, { pref, city, keito, status, q, lat, lng,
   let matched = ramenFilterFull(arr, { city, keito, status, q, exact, chain, chainSub });
   if (spiceLevel) matched = matched.filter(spiceMatch);
   matched = matched.filter(venueMatch);
+  const fb = matched.length === 0 ? await ramenZeroFallback(env, { q, pref, venueType }) : null;
   return {
+    ...(fb || {}),
     query: { pref, city: city || null, venue_type: venueType || 'permanent', keito: keito || null, chain: chain || null, chain_sub: chainSub || null, status: status || null, q: q || null, ...(spiceLevel ? { spice_level: spiceLevel } : {}) },
     count: Math.min(matched.length, cap), total_matched: matched.length, shops: matched.slice(0, cap).map(ramenPublicShape),
     definitions: RAMEN_DEFS, attribution: RAMEN_ATTR,
@@ -2019,12 +2096,15 @@ const VIBE_SCENE_EXPAND = [
 // boost is PER ENTRY: 0.02 where spiciness is the dish's core axis (オロチョン/カラシビ/勝タン),
 // 0.01 where regional identity dominates (台湾系 — 0.02 let a Miyagi spicy-miso shop outrank the
 // Nagoya 台湾ラーメン providers, 実測 2026-08-01). Multi-match takes the max.
+// Romaji aliases matter: the audience includes visitors who type "Orochon ramen Saitama" — the
+// dish name never appears in the corpus in romaji, so without these the query degrades to a generic
+// noodle search (measured 2026-08-02 via the P6 fallback: 常勝軒/元祥… instead of ひむろ/中本).
 const VIBE_CONCEPT_EXPAND = [
-  [/オロチョン/, '北海道 札幌 味噌 辛い', { spice: 'spicy', boost: 0.02 }],
-  [/カラシビ|辛痺/, '花椒 山椒 しびれ 痺れ 担々麺 辛い', { spice: 'spicy', boost: 0.02 }],
-  [/台湾ラーメン|台湾らーめん/, '名古屋 Nagoya 辛い spicy ひき肉 ミンチ ニラ 唐辛子 にんにく', { spice: 'spicy', boost: 0.01 }],
-  [/台湾まぜそば|台湾混ぜそば/, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄', { spice: 'spicy', boost: 0.01 }],
-  [/勝浦タンタンメン|勝浦担々麺|勝タン/, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy', { spice: 'spicy', boost: 0.02 }],
+  [/オロチョン|orochon/i, '北海道 札幌 味噌 辛い', { spice: 'spicy', boost: 0.02 }],
+  [/カラシビ|辛痺|karashibi/i, '花椒 山椒 しびれ 痺れ 担々麺 辛い', { spice: 'spicy', boost: 0.02 }],
+  [/台湾ラーメン|台湾らーめん|taiwan(ese)?[ -]?ramen/i, '名古屋 Nagoya 辛い spicy ひき肉 ミンチ ニラ 唐辛子 にんにく', { spice: 'spicy', boost: 0.01 }],
+  [/台湾まぜそば|台湾混ぜそば|taiwan[ -]?mazesoba/i, '名古屋 まぜそば 油そば abura soba mazesoba brothless 台湾ミンチ 辛い ひき肉 ニラ 卵黄', { spice: 'spicy', boost: 0.01 }],
+  [/勝浦タンタンメン|勝浦担々麺|勝タン|katsuura[ -]?tantan(men)?/i, '千葉 勝浦 担々麺 tantanmen ラー油 玉ねぎ 豚ひき肉 辛い spicy', { spice: 'spicy', boost: 0.02 }],
 ];
 // P2-b (2026-08-02 決裁): soft boosts are RELATIVE to the retrieved pool's similarity spread,
 // not absolute. bge-m3 similarity has no absolute scale and pool width varies per query (measured
